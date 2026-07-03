@@ -166,6 +166,1428 @@ class PlotCreator:
         plt.savefig("Kinematic.pdf")
         plt.show(block=True)
 
+    def _resolve_evaluation_trial(
+            self,
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            trial_types=("Landing", "Flying", "NF", "NA")
+    ):
+        if isinstance(groups, dict):
+            if group_name in groups:
+                group_info = groups[group_name]
+            else:
+                matches = [group for group in groups.values() if group.group_name == group_name]
+                if len(matches) != 1:
+                    raise KeyError(f"Could not resolve group_name '{group_name}' from groups.")
+                group_info = matches[0]
+        else:
+            group_info = groups
+            if group_name not in {None, group_info.group_name}:
+                raise ValueError(f"Provided group is '{group_info.group_name}', not '{group_name}'.")
+
+        if len(group_info.trial_metadata) == 0:
+            group_info.initialize_manual_data()
+        group_info.read_kinematic_data(list(trial_types))
+
+        key = group_info._trial_key(fly_number, trial_number)
+        if key not in group_info.fly_kinematic_data:
+            raise KeyError(f"{group_info.group_name} trial F{fly_number}T{trial_number} was not loaded.")
+        return group_info, group_info.fly_kinematic_data[key]
+
+    def _default_skeleton_segments(self):
+        return [
+            [group[i], group[i + 1]]
+            for group in self.key_point_pairs
+            for i in range(len(group) - 1)
+        ]
+
+    def _validate_segments(self, segments):
+        if segments is None:
+            return self._default_skeleton_segments()
+        return [list(segment) for segment in segments]
+
+    def _evaluation_unit(self, vector, name):
+        vector = np.asarray(vector, dtype=float)
+        norm = np.linalg.norm(vector)
+        if not np.isfinite(norm) or norm < 1e-8:
+            raise ValueError(f"{name} has near-zero length.")
+        return vector / norm
+
+    def _evaluation_projection_basis(
+            self,
+            trial_info,
+            plane_axis=("R-mBC", "L-mBC"),
+            motion_start_frame=200,
+            motion_stop_frame=250
+    ):
+        point_a = self.calculator.ReadAndTranspose(plane_axis[0], trial_info).astype(float)
+        point_b = self.calculator.ReadAndTranspose(plane_axis[1], trial_info).astype(float)
+        plane_vector = np.nanmean(point_b - point_a, axis=0)
+        plane_normal = self._evaluation_unit(plane_vector, "projection plane normal")
+
+        platform_xyz = self.calculator.ReadAndTranspose("platform-tip", trial_info).astype(float)
+        start = max(int(motion_start_frame), 0)
+        stop = min(int(motion_stop_frame) + 1, len(platform_xyz))
+        if stop - start < 2:
+            raise ValueError("platform-tip motion window has fewer than 2 frames.")
+
+        coords = platform_xyz[start:stop]
+        coords = coords[np.all(np.isfinite(coords), axis=1)]
+        if len(coords) < 2:
+            raise ValueError("platform-tip motion window has fewer than 2 finite coordinates.")
+
+        centered = coords - np.nanmean(coords, axis=0)
+        _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+        if singular_values[0] < 1e-8:
+            raise ValueError("platform-tip motion window has near-zero movement.")
+        motion = vh[0]
+        net_motion = coords[-1] - coords[0]
+        if np.dot(motion, net_motion) < 0:
+            motion = -motion
+
+        basis_y = self._evaluation_unit(
+            motion - np.dot(motion, plane_normal) * plane_normal,
+            "platform-tip motion projected onto plane"
+        )
+        basis_x = self._evaluation_unit(
+            np.cross(basis_y, plane_normal),
+            "platform-motion-derived projected x-axis"
+        )
+        return plane_normal, basis_x, basis_y
+
+    def _project_evaluation_point(self, point, origin_3d, plane_normal, basis_x, basis_y):
+        point = np.asarray(point, dtype=float)
+        if not np.all(np.isfinite(point)):
+            return np.nan, np.nan
+        point_on_plane = point - np.dot(point - origin_3d, plane_normal) * plane_normal
+        relative = point_on_plane - origin_3d
+        return float(np.dot(relative, basis_x)), float(np.dot(relative, basis_y))
+
+    def show_kinematic_frame_3d(
+            self,
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            frame_number,
+            segments=None,
+            trial_types=("Landing", "Flying", "NF", "NA"),
+            axis_limit=None,
+            line_width=2.0,
+            marker_size=18,
+            show_labels=False
+    ):
+        group_info, trial_info = self._resolve_evaluation_trial(
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            trial_types=trial_types
+        )
+        frame = int(frame_number)
+        if frame < 0 or frame >= trial_info.total_frames_number:
+            raise ValueError(f"frame_number must be between 0 and {trial_info.total_frames_number - 1}.")
+
+        segments = self._validate_segments(segments)
+        cmap = plt.get_cmap("viridis")
+        segment_colors = cmap(np.linspace(0.05, 0.95, max(len(segments), 1)))
+
+        fig = plt.figure(figsize=(8, 7))
+        ax = fig.add_subplot(111, projection="3d")
+        all_points = []
+        for i, (pt1, pt2) in enumerate(segments):
+            if pt1 not in trial_info.trial_data or pt2 not in trial_info.trial_data:
+                continue
+            p1 = self.calculator.ReadAndTranspose(pt1, trial_info).astype(float)[frame]
+            p2 = self.calculator.ReadAndTranspose(pt2, trial_info).astype(float)[frame]
+            if not np.all(np.isfinite(p1)) or not np.all(np.isfinite(p2)):
+                continue
+            color = segment_colors[i]
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=color, linewidth=line_width)
+            ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=color, s=marker_size)
+            all_points.extend([p1, p2])
+            if show_labels:
+                ax.text(p1[0], p1[1], p1[2], pt1, fontsize=7)
+                ax.text(p2[0], p2[1], p2[2], pt2, fontsize=7)
+
+        if all_points:
+            all_points = np.asarray(all_points, dtype=float)
+            center = np.nanmean(all_points, axis=0)
+            if axis_limit is None:
+                axis_limit = max(np.nanmax(np.abs(all_points - center)), 0.5) * 1.15
+            ax.set_xlim(center[0] - axis_limit, center[0] + axis_limit)
+            ax.set_ylim(center[1] - axis_limit, center[1] + axis_limit)
+            ax.set_zlim(center[2] - axis_limit, center[2] + axis_limit)
+
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_title(f"{group_info.group_name} F{fly_number}T{trial_number}, frame {frame}")
+        plt.tight_layout()
+        plt.show()
+        return fig, ax, trial_info
+
+    def show_kinematic_frame_projected_2d(
+            self,
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            frame_number,
+            plane_axis=("R-mBC", "L-mBC"),
+            origin_keypoint="R-mBC",
+            segments=None,
+            trial_types=("Landing", "Flying", "NF", "NA"),
+            motion_start_frame=200,
+            motion_stop_frame=250,
+            axis_limit=None,
+            line_width=2.0,
+            marker_size=18,
+            show_labels=False
+    ):
+        group_info, trial_info = self._resolve_evaluation_trial(
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            trial_types=trial_types
+        )
+        frame = int(frame_number)
+        if frame < 0 or frame >= trial_info.total_frames_number:
+            raise ValueError(f"frame_number must be between 0 and {trial_info.total_frames_number - 1}.")
+
+        segments = self._validate_segments(segments)
+        plane_normal, basis_x, basis_y = self._evaluation_projection_basis(
+            trial_info,
+            plane_axis=plane_axis,
+            motion_start_frame=motion_start_frame,
+            motion_stop_frame=motion_stop_frame
+        )
+        origin_xyz = self.calculator.ReadAndTranspose(origin_keypoint, trial_info).astype(float)[frame]
+
+        cmap = plt.get_cmap("viridis")
+        segment_colors = cmap(np.linspace(0.05, 0.95, max(len(segments), 1)))
+        fig, ax = plt.subplots(figsize=(7, 7))
+        all_points = []
+        for i, (pt1, pt2) in enumerate(segments):
+            if pt1 not in trial_info.trial_data or pt2 not in trial_info.trial_data:
+                continue
+            xyz1 = self.calculator.ReadAndTranspose(pt1, trial_info).astype(float)[frame]
+            xyz2 = self.calculator.ReadAndTranspose(pt2, trial_info).astype(float)[frame]
+            p1 = self._project_evaluation_point(xyz1, origin_xyz, plane_normal, basis_x, basis_y)
+            p2 = self._project_evaluation_point(xyz2, origin_xyz, plane_normal, basis_x, basis_y)
+            if not np.all(np.isfinite(p1)) or not np.all(np.isfinite(p2)):
+                continue
+            color = segment_colors[i]
+            ax.plot([p1[0], p2[0]], [p1[1], p2[1]], color=color, linewidth=line_width)
+            ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], color=color, s=marker_size)
+            all_points.extend([p1, p2])
+            if show_labels:
+                ax.text(p1[0], p1[1], pt1, fontsize=7)
+                ax.text(p2[0], p2[1], pt2, fontsize=7)
+
+        if all_points:
+            all_points = np.asarray(all_points, dtype=float)
+            center = np.nanmean(all_points, axis=0)
+            if axis_limit is None:
+                axis_limit = max(np.nanmax(np.abs(all_points - center)), 0.5) * 1.15
+            ax.set_xlim(center[0] - axis_limit, center[0] + axis_limit)
+            ax.set_ylim(center[1] - axis_limit, center[1] + axis_limit)
+        ax.set_aspect("equal", adjustable="box")
+        ax.axhline(0, color="0.85", linewidth=0.8)
+        ax.axvline(0, color="0.85", linewidth=0.8)
+        ax.set_xlabel(f"Projected X from {origin_keypoint}")
+        ax.set_ylabel(f"Projected Y from {origin_keypoint}")
+        ax.set_title(f"{group_info.group_name} F{fly_number}T{trial_number}, frame {frame}")
+        sns.despine()
+        plt.tight_layout()
+        plt.show()
+        return fig, ax, trial_info
+
+    def plot_segment_length_change_evaluation(
+            self,
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            segments,
+            trial_types=("Landing", "Flying", "NF", "NA"),
+            baseline_seconds=1.0,
+            start_frame=None,
+            stop_frame=None,
+            file_name=None,
+            save_csv=True
+    ):
+        group_info, trial_info = self._resolve_evaluation_trial(
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            trial_types=trial_types
+        )
+        segments = self._validate_segments(segments)
+        fps = float(trial_info.fps)
+        n_frames = int(trial_info.total_frames_number)
+        baseline_n = max(1, min(int(round(baseline_seconds * fps)), n_frames))
+        time_s = np.arange(n_frames, dtype=float) / fps
+        if start_frame is None:
+            start_frame = 0
+        if stop_frame is None:
+            stop_frame = n_frames - 1
+        start_frame = int(start_frame)
+        stop_frame = int(stop_frame)
+        if start_frame < 0 or start_frame >= n_frames:
+            raise ValueError(f"start_frame must be between 0 and {n_frames - 1}.")
+        if stop_frame < start_frame or stop_frame >= n_frames:
+            raise ValueError(f"stop_frame must be between start_frame and {n_frames - 1}.")
+        frame_range = range(start_frame, stop_frame + 1)
+
+        rows = []
+        for segment_i, (pt1, pt2) in enumerate(segments):
+            if pt1 not in trial_info.trial_data or pt2 not in trial_info.trial_data:
+                continue
+            xyz1 = self.calculator.ReadAndTranspose(pt1, trial_info).astype(float)
+            xyz2 = self.calculator.ReadAndTranspose(pt2, trial_info).astype(float)
+            length_3d = np.linalg.norm(xyz2 - xyz1, axis=1)
+
+            baseline_3d = np.nanmean(length_3d[:baseline_n])
+            segment_label = f"{pt1}-{pt2}"
+            for frame in frame_range:
+                percent_change = np.nan
+                if np.isfinite(baseline_3d) and baseline_3d != 0:
+                    percent_change = ((length_3d[frame] - baseline_3d) / baseline_3d) * 100
+                rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Fly#": fly_number,
+                    "Trial#": trial_number,
+                    "Frame": frame,
+                    "Time_s": time_s[frame],
+                    "Segment": segment_label,
+                    "Point_A": pt1,
+                    "Point_B": pt2,
+                    "Length_3D": length_3d[frame],
+                    "Baseline_Length_3D": baseline_3d,
+                    "Delta_Length_3D": length_3d[frame] - baseline_3d,
+                    "Percent_Change_From_Baseline": percent_change,
+                    "Baseline_Frames": baseline_n,
+                    "Baseline_Seconds": baseline_seconds,
+                    "Plot_Start_Frame": start_frame,
+                    "Plot_Stop_Frame": stop_frame,
+                })
+
+        length_df = pd.DataFrame(rows)
+        if length_df.empty:
+            raise ValueError("No valid segment length data were available.")
+
+        cmap = plt.get_cmap("viridis")
+        segment_labels = list(length_df["Segment"].drop_duplicates())
+        colors = {
+            segment: cmap(i / max(len(segment_labels) - 1, 1))
+            for i, segment in enumerate(segment_labels)
+        }
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        for segment in segment_labels:
+            sub = length_df[length_df["Segment"] == segment]
+            axes[0].plot(
+                sub["Time_s"],
+                sub["Percent_Change_From_Baseline"],
+                color=colors[segment],
+                linewidth=1.6,
+                label=segment
+            )
+            axes[1].plot(sub["Time_s"], sub["Length_3D"], color=colors[segment], linewidth=1.6, label=segment)
+
+        axes[0].axhline(0, color="0.75", linewidth=0.8)
+        axes[0].set_ylim(-100, 100)
+        axes[0].set_yticks(np.arange(-100, 101, 50))
+        axes[0].set_ylabel("% change from baseline")
+        axes[1].set_ylabel("Raw 3D segment length")
+        axes[1].set_xlabel("Time (s)")
+        axes[0].set_title(
+            f"{group_info.group_name} F{fly_number}T{trial_number}: 3D segment length evaluation, frames {start_frame}-{stop_frame}"
+        )
+
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            title="Segment",
+            loc="center left",
+            bbox_to_anchor=(0.86, 0.5),
+            frameon=True
+        )
+        sns.despine()
+        fig.tight_layout(rect=[0, 0, 0.84, 1])
+
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            if save_csv:
+                length_df.to_csv(f"{file_name}_data.csv", index=False)
+        return fig, axes, length_df
+
+    def plot_segment_length_change_average_moc_aligned(
+            self,
+            groups,
+            group_name,
+            segments,
+            start_s=-0.2,
+            stop_s=0.7,
+            target_fps=250,
+            trial_types=("Landing", "Flying"),
+            baseline_seconds=1.0,
+            min_valid_points=2,
+            file_name=None,
+            save_csv=True
+    ):
+        """
+        Plot MOC-aligned mean +/- std segment-length changes across trials.
+
+        Baseline normalization is computed per trial and segment from that
+        trial's first baseline_seconds seconds. Traces are then aligned to MOC
+        and resampled to target_fps between start_s and stop_s.
+        """
+        if target_fps <= 0:
+            raise ValueError("target_fps must be > 0.")
+        if stop_s <= start_s:
+            raise ValueError("stop_s must be greater than start_s.")
+
+        if isinstance(groups, dict):
+            if group_name in groups:
+                group_info = groups[group_name]
+            else:
+                matches = [group for group in groups.values() if group.group_name == group_name]
+                if len(matches) != 1:
+                    raise KeyError(f"Could not resolve group_name '{group_name}' from groups.")
+                group_info = matches[0]
+        else:
+            group_info = groups
+            if group_name not in {None, group_info.group_name}:
+                raise ValueError(f"Provided group is '{group_info.group_name}', not '{group_name}'.")
+
+        if len(group_info.trial_metadata) == 0:
+            group_info.initialize_manual_data()
+        group_info.read_kinematic_data(list(trial_types))
+
+        segments = self._validate_segments(segments)
+        time_grid = np.arange(start_s, stop_s + (0.5 / target_fps), 1 / target_fps)
+        time_grid = time_grid[time_grid <= stop_s]
+
+        trial_rows = []
+        skipped_rows = []
+        for index in group_info.get_targeted_trials(list(trial_types)):
+            key = group_info._trial_key(index[0], index[1])
+            if key not in group_info.fly_kinematic_data:
+                skipped_rows.append({"Index": str(index), "Reason": "kinematic trial was not loaded/found"})
+                continue
+
+            trial_info = group_info.fly_kinematic_data[key]
+            fps = float(trial_info.fps)
+            moc = trial_info.moc
+            if pd.isna(fps) or pd.isna(moc):
+                skipped_rows.append({"Index": str(index), "Reason": "missing fps or MOC"})
+                continue
+            moc = int(moc)
+            n_frames = int(trial_info.total_frames_number)
+            baseline_n = max(1, min(int(round(baseline_seconds * fps)), n_frames))
+            source_frames = np.arange(n_frames, dtype=float)
+            sample_frames = moc + time_grid * fps
+
+            valid_sample = (sample_frames >= 0) & (sample_frames <= n_frames - 1)
+            if np.sum(valid_sample) < min_valid_points:
+                skipped_rows.append({"Index": str(index), "Reason": "requested MOC-aligned window is outside trial"})
+                continue
+
+            for pt1, pt2 in segments:
+                if pt1 not in trial_info.trial_data or pt2 not in trial_info.trial_data:
+                    skipped_rows.append({"Index": str(index), "Reason": f"missing segment points: {pt1}-{pt2}"})
+                    continue
+
+                xyz1 = self.calculator.ReadAndTranspose(pt1, trial_info).astype(float)
+                xyz2 = self.calculator.ReadAndTranspose(pt2, trial_info).astype(float)
+                length_3d = np.linalg.norm(xyz2 - xyz1, axis=1)
+                baseline = np.nanmean(length_3d[:baseline_n])
+                delta = length_3d - baseline
+                percent = np.full(n_frames, np.nan, dtype=float)
+                if np.isfinite(baseline) and baseline != 0:
+                    percent = (delta / baseline) * 100
+
+                interp_delta = np.full(len(time_grid), np.nan, dtype=float)
+                interp_percent = np.full(len(time_grid), np.nan, dtype=float)
+                interp_delta[valid_sample] = np.interp(
+                    sample_frames[valid_sample],
+                    source_frames,
+                    delta
+                )
+                interp_percent[valid_sample] = np.interp(
+                    sample_frames[valid_sample],
+                    source_frames,
+                    percent
+                )
+
+                segment_label = f"{pt1}-{pt2}"
+                for i, time_value in enumerate(time_grid):
+                    trial_rows.append({
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "Segment": segment_label,
+                        "Point_A": pt1,
+                        "Point_B": pt2,
+                        "Time_From_MOC_s": time_value,
+                        "Delta_Length_3D": interp_delta[i],
+                        "Percent_Change_From_Baseline": interp_percent[i],
+                        "Baseline_Length_3D": baseline,
+                        "Baseline_Frames": baseline_n,
+                        "Baseline_Seconds": baseline_seconds,
+                        "Target_FPS": target_fps,
+                    })
+
+        trial_df = pd.DataFrame(trial_rows)
+        skipped_df = pd.DataFrame(skipped_rows)
+        if trial_df.empty:
+            raise ValueError(f"No valid segment traces were available. Skipped: {skipped_rows}")
+
+        summary_df = (
+            trial_df
+            .groupby(["Segment", "Point_A", "Point_B", "Time_From_MOC_s"], as_index=False)
+            .agg(
+                Mean_Percent_Change=("Percent_Change_From_Baseline", "mean"),
+                Std_Percent_Change=("Percent_Change_From_Baseline", "std"),
+                Mean_Delta_Length_3D=("Delta_Length_3D", "mean"),
+                Std_Delta_Length_3D=("Delta_Length_3D", "std"),
+                n_trials=("Index", "nunique")
+            )
+        )
+
+        cmap = plt.get_cmap("viridis")
+        segment_labels = list(summary_df["Segment"].drop_duplicates())
+        colors = {
+            segment: cmap(i / max(len(segment_labels) - 1, 1))
+            for i, segment in enumerate(segment_labels)
+        }
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        for segment in segment_labels:
+            sub = summary_df[summary_df["Segment"] == segment].sort_values("Time_From_MOC_s")
+            time_values = sub["Time_From_MOC_s"].to_numpy(dtype=float)
+            mean_percent = sub["Mean_Percent_Change"].to_numpy(dtype=float)
+            std_percent = sub["Std_Percent_Change"].fillna(0).to_numpy(dtype=float)
+            mean_delta = sub["Mean_Delta_Length_3D"].to_numpy(dtype=float)
+            std_delta = sub["Std_Delta_Length_3D"].fillna(0).to_numpy(dtype=float)
+            color = colors[segment]
+
+            axes[0].plot(time_values, mean_percent, color=color, linewidth=1.8, label=segment)
+            axes[0].fill_between(
+                time_values,
+                mean_percent - std_percent,
+                mean_percent + std_percent,
+                color=color,
+                alpha=0.18,
+                linewidth=0
+            )
+            axes[1].plot(time_values, mean_delta, color=color, linewidth=1.8, label=segment)
+            axes[1].fill_between(
+                time_values,
+                mean_delta - std_delta,
+                mean_delta + std_delta,
+                color=color,
+                alpha=0.18,
+                linewidth=0
+            )
+
+        for ax in axes:
+            ax.axvline(0, color="black", linestyle="--", linewidth=0.9)
+            ax.axhline(0, color="0.75", linewidth=0.8)
+        axes[0].set_ylim(-100, 100)
+        axes[0].set_yticks(np.arange(-100, 101, 50))
+        axes[0].set_ylabel("% change from baseline")
+        axes[1].set_ylabel("Raw 3D length change")
+        axes[1].set_xlabel("Time from MOC (s)")
+        axes[0].set_title(
+            f"{group_info.group_name}: MOC-aligned segment length change, mean +/- std"
+        )
+
+        handles, labels = axes[0].get_legend_handles_labels()
+        fig.legend(
+            handles,
+            labels,
+            title="Segment",
+            loc="center left",
+            bbox_to_anchor=(0.86, 0.5),
+            frameon=True
+        )
+        sns.despine()
+        fig.tight_layout(rect=[0, 0, 0.84, 1])
+
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            if save_csv:
+                trial_df.to_csv(f"{file_name}_trial_traces.csv", index=False)
+                summary_df.to_csv(f"{file_name}_summary.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, axes, trial_df, summary_df, skipped_df
+
+    def collect_tracking_quality_dataframe(
+            self,
+            groups,
+            group_name,
+            keypoints=None,
+            trial_types=("Landing", "Flying"),
+            tau=0.71,
+            margin_s=0.2,
+            min_cameras=2,
+            max_error=None,
+    ):
+        """
+        Collect frame-level tracking QC values for selected keypoints.
+
+        The analysis window is MOC->MOL for successful trials and MOC->MOC+tau
+        for failed/flying trials. The collected diagnostic window extends this
+        by margin_s on each side.
+        """
+        if isinstance(groups, dict):
+            if group_name in groups:
+                group_info = groups[group_name]
+            else:
+                matches = [group for group in groups.values() if group.group_name == group_name]
+                if len(matches) != 1:
+                    raise KeyError(f"Could not resolve group_name '{group_name}' from groups.")
+                group_info = matches[0]
+        else:
+            group_info = groups
+            if group_name not in {None, group_info.group_name}:
+                raise ValueError(f"Provided group is '{group_info.group_name}', not '{group_name}'.")
+
+        if len(group_info.trial_metadata) == 0:
+            group_info.initialize_manual_data()
+        group_info.read_kinematic_data(list(trial_types))
+
+        rows = []
+        skipped_rows = []
+
+        def classify_trial(meta):
+            ll = meta["LL"]
+            fps = meta["fps"]
+            if (
+                    meta["TrialType"] == "Landing"
+                    and not pd.isna(ll)
+                    and ll != -1
+                    and (ll / fps) <= group_info.latency_threshold
+            ):
+                return "Success"
+            return "Failed"
+
+        for index in group_info.get_targeted_trials(list(trial_types)):
+            key = group_info._trial_key(index[0], index[1])
+            if key not in group_info.fly_kinematic_data or key not in group_info.trial_metadata:
+                skipped_rows.append({"Index": str(index), "Reason": "missing kinematic data or metadata"})
+                continue
+
+            trial_info = group_info.fly_kinematic_data[key]
+            meta = group_info.trial_metadata[key]
+            moc = trial_info.moc
+            mol = trial_info.mol
+            fps = trial_info.fps
+            if pd.isna(moc) or pd.isna(fps):
+                skipped_rows.append({"Index": str(index), "Reason": "missing MOC or fps"})
+                continue
+
+            moc = int(moc)
+            fps = float(fps)
+            outcome = classify_trial(meta)
+            if outcome == "Success" and not pd.isna(mol) and mol > moc:
+                analysis_end = int(min(mol, trial_info.total_frames_number - 1))
+                endpoint_rule = "MOL"
+            else:
+                analysis_end = int(min(moc + tau * fps, trial_info.total_frames_number - 1))
+                endpoint_rule = "MOC_plus_tau"
+
+            if analysis_end <= moc:
+                skipped_rows.append({"Index": str(index), "Reason": "empty analysis window"})
+                continue
+
+            margin_frames = int(round(margin_s * fps))
+            qc_start = max(0, moc - margin_frames)
+            qc_stop = min(trial_info.total_frames_number - 1, analysis_end + margin_frames)
+            points_to_use = list(keypoints) if keypoints is not None else list(trial_info.trial_data.keys())
+
+            for point_name in points_to_use:
+                if point_name not in trial_info.trial_data:
+                    skipped_rows.append({"Index": str(index), "Reason": f"missing keypoint: {point_name}"})
+                    continue
+
+                point = trial_info.trial_data[point_name]
+                x = np.asarray(point.x_coord, dtype=float)
+                y = np.asarray(point.y_coord, dtype=float)
+                z = np.asarray(point.z_coord, dtype=float)
+                camera_count = np.asarray(point.camera_count, dtype=float)
+                error = np.asarray(point.error, dtype=float)
+
+                for frame in range(qc_start, qc_stop + 1):
+                    finite_coord = np.isfinite(x[frame]) and np.isfinite(y[frame]) and np.isfinite(z[frame])
+                    finite_error = np.isfinite(error[frame])
+                    camera_ok = np.isfinite(camera_count[frame]) and camera_count[frame] >= min_cameras
+                    error_ok = True if max_error is None else (finite_error and error[frame] <= max_error)
+                    rows.append({
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "TrialType": meta["TrialType"],
+                        "Outcome": outcome,
+                        "Keypoint": point_name,
+                        "Frame": frame,
+                        "Time_From_MOC_s": (frame - moc) / fps,
+                        "In_Analysis_Window": moc <= frame <= analysis_end,
+                        "Analysis_Start_Frame": moc,
+                        "Analysis_End_Frame": analysis_end,
+                        "Endpoint_Rule": endpoint_rule,
+                        "QC_Start_Frame": qc_start,
+                        "QC_Stop_Frame": qc_stop,
+                        "Camera_Count": camera_count[frame],
+                        "Error": error[frame],
+                        "Finite_Coordinates": finite_coord,
+                        "Finite_Error": finite_error,
+                        "Camera_OK": camera_ok,
+                        "Error_OK": error_ok,
+                        "Valid_QC_Frame": finite_coord and camera_ok and error_ok,
+                        "Min_Cameras": min_cameras,
+                        "Max_Error": max_error,
+                        "Tau_s": tau,
+                        "Margin_s": margin_s,
+                    })
+
+        qc_df = pd.DataFrame(rows)
+        skipped_df = pd.DataFrame(skipped_rows)
+        if qc_df.empty:
+            raise ValueError(f"No tracking QC rows were collected. Skipped: {skipped_rows}")
+        return qc_df, skipped_df
+
+    def plot_tracking_error_distribution(
+            self,
+            groups,
+            group_name,
+            keypoints=None,
+            percentile=90,
+            file_name=None,
+            **qc_kwargs
+    ):
+        qc_df, skipped_df = self.collect_tracking_quality_dataframe(
+            groups,
+            group_name,
+            keypoints=keypoints,
+            **qc_kwargs
+        )
+        plot_df = qc_df[qc_df["In_Analysis_Window"] & qc_df["Finite_Error"]].copy()
+        if plot_df.empty:
+            raise ValueError("No finite error values were available in the analysis window.")
+
+        percentile_df = (
+            plot_df
+            .groupby("Keypoint", as_index=False)
+            .agg(Percentile_Error=("Error", lambda values: np.nanpercentile(values, percentile)))
+        )
+        keypoint_order = list(plot_df["Keypoint"].drop_duplicates())
+        percentile_df["Keypoint"] = pd.Categorical(
+            percentile_df["Keypoint"],
+            categories=keypoint_order,
+            ordered=True
+        )
+        percentile_df = percentile_df.sort_values("Keypoint")
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.36 * plot_df["Keypoint"].nunique()), 4.8))
+        sns.boxplot(data=plot_df, x="Keypoint", y="Error", color="white", fliersize=0, ax=ax)
+        sns.stripplot(
+            data=plot_df.sample(min(len(plot_df), 6000), random_state=0),
+            x="Keypoint",
+            y="Error",
+            hue="Outcome",
+            dodge=False,
+            jitter=0.2,
+            size=1.5,
+            alpha=0.22,
+            ax=ax
+        )
+        xtick_positions = {tick.get_text(): i for i, tick in enumerate(ax.get_xticklabels())}
+        first_label = True
+        for _, row in percentile_df.iterrows():
+            keypoint = str(row["Keypoint"])
+            if keypoint not in xtick_positions:
+                continue
+            ax.scatter(
+                xtick_positions[keypoint],
+                row["Percentile_Error"],
+                marker="D",
+                s=34,
+                color="red",
+                edgecolor="black",
+                linewidth=0.4,
+                zorder=5,
+                label=f"{percentile}th percentile" if first_label else None
+            )
+            ax.text(
+                xtick_positions[keypoint] + 0.08,
+                row["Percentile_Error"],
+                f"{row['Percentile_Error']:.2g}",
+                color="red",
+                fontsize=7,
+                ha="left",
+                va="center",
+                rotation=90,
+                zorder=6
+            )
+            first_label = False
+        ax.set_title(f"{group_name}: tracking error by keypoint")
+        ax.set_xlabel("Keypoint")
+        ax.set_ylabel("Tracking/reconstruction error")
+        ax.tick_params(axis="x", rotation=90)
+        ax.legend(frameon=False, title="Legend", loc="center left", bbox_to_anchor=(1.0, 0.5))
+        sns.despine()
+        plt.tight_layout(rect=[0, 0, 0.86, 1])
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            qc_df.to_csv(f"{file_name}_data.csv", index=False)
+            percentile_df.to_csv(f"{file_name}_percentile_summary.csv", index=False)
+            skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, ax, percentile_df, qc_df, skipped_df
+
+    def plot_tracking_camera_count_distribution(
+            self,
+            groups,
+            group_name,
+            keypoints=None,
+            file_name=None,
+            **qc_kwargs
+    ):
+        qc_df, skipped_df = self.collect_tracking_quality_dataframe(
+            groups,
+            group_name,
+            keypoints=keypoints,
+            **qc_kwargs
+        )
+        plot_df = qc_df[qc_df["In_Analysis_Window"]].copy()
+        count_df = (
+            plot_df
+            .groupby(["Keypoint", "Camera_Count"], dropna=False)
+            .size()
+            .reset_index(name="Frame_Count")
+        )
+        total = count_df.groupby("Keypoint")["Frame_Count"].transform("sum")
+        count_df["Frame_Fraction"] = count_df["Frame_Count"] / total
+        pivot = (
+            count_df
+            .pivot(index="Keypoint", columns="Camera_Count", values="Frame_Fraction")
+            .fillna(0)
+            .sort_index()
+        )
+
+        fig, ax = plt.subplots(figsize=(7.5, max(4.0, 0.24 * len(pivot))))
+        sns.heatmap(pivot, cmap="viridis", vmin=0, vmax=1, ax=ax, cbar_kws={"label": "Frame fraction"})
+        ax.set_title(f"{group_name}: camera-count distribution by keypoint")
+        ax.set_xlabel("Camera count")
+        ax.set_ylabel("Keypoint")
+        plt.tight_layout()
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            count_df.to_csv(f"{file_name}_summary.csv", index=False)
+            qc_df.to_csv(f"{file_name}_data.csv", index=False)
+            skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, ax, count_df, qc_df, skipped_df
+
+    def plot_tracking_error_by_camera_count(
+            self,
+            groups,
+            group_name,
+            keypoints=None,
+            file_name=None,
+            **qc_kwargs
+    ):
+        qc_df, skipped_df = self.collect_tracking_quality_dataframe(
+            groups,
+            group_name,
+            keypoints=keypoints,
+            **qc_kwargs
+        )
+        plot_df = qc_df[qc_df["In_Analysis_Window"] & qc_df["Finite_Error"]].copy()
+        if plot_df.empty:
+            raise ValueError("No finite error values were available in the analysis window.")
+
+        fig, ax = plt.subplots(figsize=(6.5, 4.8))
+        sns.boxplot(data=plot_df, x="Camera_Count", y="Error", hue="Outcome", fliersize=0, ax=ax)
+        sns.stripplot(
+            data=plot_df.sample(min(len(plot_df), 6000), random_state=0),
+            x="Camera_Count",
+            y="Error",
+            hue="Outcome",
+            dodge=True,
+            jitter=0.18,
+            size=1.5,
+            alpha=0.18,
+            legend=False,
+            ax=ax
+        )
+        ax.set_title(f"{group_name}: tracking error by camera count")
+        ax.set_xlabel("Camera count")
+        ax.set_ylabel("Tracking/reconstruction error")
+        ax.legend(frameon=False, title="Outcome", loc="center left", bbox_to_anchor=(1.0, 0.5))
+        sns.despine()
+        plt.tight_layout(rect=[0, 0, 0.86, 1])
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            qc_df.to_csv(f"{file_name}_data.csv", index=False)
+            skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, ax, qc_df, skipped_df
+
+    def plot_tracking_valid_frame_fraction(
+            self,
+            groups,
+            group_name,
+            keypoints=None,
+            file_name=None,
+            **qc_kwargs
+    ):
+        qc_df, skipped_df = self.collect_tracking_quality_dataframe(
+            groups,
+            group_name,
+            keypoints=keypoints,
+            **qc_kwargs
+        )
+        analysis_df = qc_df[qc_df["In_Analysis_Window"]].copy()
+        fraction_df = (
+            analysis_df
+            .groupby(["Index", "Fly#", "Trial#", "Outcome", "Keypoint"], as_index=False)
+            .agg(
+                Valid_Frame_Fraction=("Valid_QC_Frame", "mean"),
+                n_frames=("Valid_QC_Frame", "size"),
+                Median_Error=("Error", "median"),
+                Min_Camera_Count=("Camera_Count", "min"),
+            )
+        )
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.36 * fraction_df["Keypoint"].nunique()), 4.8))
+        sns.stripplot(
+            data=fraction_df,
+            x="Keypoint",
+            y="Valid_Frame_Fraction",
+            hue="Outcome",
+            dodge=True,
+            jitter=0.18,
+            size=3,
+            alpha=0.75,
+            ax=ax
+        )
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(f"{group_name}: valid-frame fraction in analysis window")
+        ax.set_xlabel("Keypoint")
+        ax.set_ylabel("Valid-frame fraction")
+        ax.tick_params(axis="x", rotation=90)
+        ax.legend(frameon=False, title="Outcome", loc="center left", bbox_to_anchor=(1.0, 0.5))
+        sns.despine()
+        plt.tight_layout(rect=[0, 0, 0.86, 1])
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            fraction_df.to_csv(f"{file_name}_summary.csv", index=False)
+            qc_df.to_csv(f"{file_name}_data.csv", index=False)
+            skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, ax, fraction_df, qc_df, skipped_df
+
+    def get_keypoints_error_threshold(
+            self,
+            group_infos,
+            percentile=90,
+            percentile_by_keypoint=None,
+            min_cameras=2,
+            trial_types=("Landing", "Flying"),
+            tau=0.71,
+            margin_s=0.2,
+            keypoints=None,
+            file_name=None,
+            save_csv=True
+    ):
+        """
+        Calculate keypoint-specific tracking error thresholds from multiple
+        contact groups.
+
+        Thresholds are computed from Landing/Flying frames in the analysis
+        window plus margin_s on each side. The analysis window is MOC->MOL
+        when MOL is available and after MOC, otherwise MOC->MOC+tau. Frames
+        must have finite xyz, camera_count >= min_cameras, and finite error.
+        percentile_by_keypoint can override the default percentile for
+        specific keypoints.
+        """
+        if isinstance(group_infos, dict):
+            group_items = list(group_infos.items())
+        elif isinstance(group_infos, (list, tuple)):
+            group_items = [(group.group_name, group) for group in group_infos]
+        else:
+            raise ValueError("group_infos must be a dict or list/tuple of Group objects.")
+
+        percentile_by_keypoint = percentile_by_keypoint or {}
+        rows = []
+        skipped_rows = []
+
+        requested_trial_types = tuple(trial_types)
+        allowed_trial_types = {"Landing", "Flying"}
+        active_trial_types = tuple(trial_type for trial_type in requested_trial_types if trial_type in allowed_trial_types)
+        if not active_trial_types:
+            raise ValueError("get_keypoints_error_threshold only analyzes Landing/Flying trials.")
+
+        for contact_group, group_info in group_items:
+            if len(group_info.trial_metadata) == 0:
+                group_info.initialize_manual_data()
+
+            try:
+                group_info.read_kinematic_data(list(active_trial_types))
+            except FileNotFoundError as exc:
+                skipped_rows.append({
+                    "Contact_Group": contact_group,
+                    "Group_Name": group_info.group_name,
+                    "Index": "",
+                    "Reason": str(exc),
+                })
+                continue
+
+            for index in group_info.get_targeted_trials(list(active_trial_types)):
+                key = group_info._trial_key(index[0], index[1])
+                if key not in group_info.fly_kinematic_data or key not in group_info.trial_metadata:
+                    skipped_rows.append({
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Reason": "missing kinematic data or metadata",
+                    })
+                    continue
+
+                trial_info = group_info.fly_kinematic_data[key]
+                meta = group_info.trial_metadata[key]
+                if meta.get("TrialType") not in allowed_trial_types:
+                    skipped_rows.append({
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Reason": f"excluded trial type: {meta.get('TrialType')}",
+                    })
+                    continue
+
+                moc = trial_info.moc
+                mol = trial_info.mol
+                fps = trial_info.fps
+                if pd.isna(moc) or pd.isna(fps):
+                    skipped_rows.append({
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Reason": "missing MOC or fps",
+                    })
+                    continue
+
+                moc = int(moc)
+                fps = float(fps)
+                total_frames = int(trial_info.total_frames_number)
+                if total_frames <= 0:
+                    skipped_rows.append({
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Reason": "missing total frame count",
+                    })
+                    continue
+
+                mol_available = not pd.isna(mol) and int(mol) > moc
+                if mol_available:
+                    analysis_end = int(min(int(mol), total_frames - 1))
+                    endpoint_rule = "MOL"
+                else:
+                    analysis_end = int(min(moc + tau * fps, total_frames - 1))
+                    endpoint_rule = "MOC_plus_tau"
+
+                if analysis_end <= moc:
+                    skipped_rows.append({
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Reason": "empty analysis window",
+                    })
+                    continue
+
+                margin_frames = int(round(margin_s * fps))
+                qc_start = max(0, moc - margin_frames)
+                qc_stop = min(total_frames - 1, analysis_end + margin_frames)
+                points_to_use = list(keypoints) if keypoints is not None else list(trial_info.trial_data.keys())
+
+                for keypoint in points_to_use:
+                    if keypoint not in trial_info.trial_data:
+                        skipped_rows.append({
+                            "Contact_Group": contact_group,
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Keypoint": keypoint,
+                            "Reason": "missing keypoint",
+                        })
+                        continue
+
+                    point = trial_info.trial_data[keypoint]
+                    x = np.asarray(point.x_coord, dtype=float)
+                    y = np.asarray(point.y_coord, dtype=float)
+                    z = np.asarray(point.z_coord, dtype=float)
+                    camera_count = np.asarray(point.camera_count, dtype=float)
+                    error = np.asarray(point.error, dtype=float)
+                    n_frames = min(len(x), len(y), len(z), len(camera_count), len(error))
+                    point_qc_stop = min(qc_stop, n_frames - 1)
+                    if point_qc_stop < qc_start:
+                        skipped_rows.append({
+                            "Contact_Group": contact_group,
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Keypoint": keypoint,
+                            "Reason": "QC window outside keypoint data",
+                        })
+                        continue
+
+                    window_slice = slice(qc_start, point_qc_stop + 1)
+                    valid = (
+                            np.isfinite(x[window_slice])
+                            & np.isfinite(y[window_slice])
+                            & np.isfinite(z[window_slice])
+                            & np.isfinite(camera_count[window_slice])
+                            & (camera_count[window_slice] >= min_cameras)
+                            & np.isfinite(error[window_slice])
+                    )
+                    valid_frames = np.arange(qc_start, point_qc_stop + 1, dtype=int)[valid]
+                    valid_errors = error[valid_frames]
+                    for frame, error_value in zip(valid_frames, valid_errors):
+                        rows.append({
+                            "Contact_Group": contact_group,
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "TrialType": meta["TrialType"],
+                            "Keypoint": keypoint,
+                            "Frame": int(frame),
+                            "Time_From_MOC_s": (frame - moc) / fps,
+                            "In_Analysis_Window": moc <= frame <= analysis_end,
+                            "Analysis_Start_Frame": moc,
+                            "Analysis_End_Frame": analysis_end,
+                            "Endpoint_Rule": endpoint_rule,
+                            "QC_Start_Frame": qc_start,
+                            "QC_Stop_Frame": point_qc_stop,
+                            "Tau_s": tau,
+                            "Margin_s": margin_s,
+                            "Camera_Count": camera_count[frame],
+                            "Error": error_value,
+                        })
+
+        qc_df = pd.DataFrame(rows)
+        skipped_df = pd.DataFrame(skipped_rows)
+        if qc_df.empty:
+            raise ValueError(f"No valid keypoint error values were available. Skipped: {skipped_rows}")
+
+        threshold_rows = []
+        for keypoint, sub in qc_df.groupby("Keypoint", sort=False):
+            keypoint_percentile = percentile_by_keypoint.get(keypoint, percentile)
+            threshold_rows.append({
+                "Keypoint": keypoint,
+                "Percentile": keypoint_percentile,
+                "Error_Threshold": float(np.nanpercentile(sub["Error"].astype(float), keypoint_percentile)),
+                "n_frames": int(len(sub)),
+                "n_trials": int(sub[["Contact_Group", "Fly#", "Trial#"]].drop_duplicates().shape[0]),
+                "n_flies": int(sub[["Contact_Group", "Fly#"]].drop_duplicates().shape[0]),
+                "Contact_Groups": ",".join(map(str, sorted(sub["Contact_Group"].dropna().unique()))),
+                "Min_Cameras": min_cameras,
+                "Tau_s": tau,
+                "Margin_s": margin_s,
+                "Analysis_Window": "MOC_to_MOL_when_available_else_MOC_plus_tau",
+            })
+        threshold_df = pd.DataFrame(threshold_rows)
+
+        fig, ax = plt.subplots(figsize=(max(8, 0.34 * qc_df["Keypoint"].nunique()), 5.2))
+        sns.boxplot(data=qc_df, x="Keypoint", y="Error", color="white", fliersize=0, ax=ax)
+        sns.stripplot(
+            data=qc_df.sample(min(len(qc_df), 8000), random_state=0),
+            x="Keypoint",
+            y="Error",
+            hue="Contact_Group",
+            dodge=False,
+            jitter=0.22,
+            size=1.5,
+            alpha=0.22,
+            ax=ax
+        )
+        xtick_positions = {tick.get_text(): i for i, tick in enumerate(ax.get_xticklabels())}
+        first_label = True
+        for _, row in threshold_df.iterrows():
+            keypoint = row["Keypoint"]
+            if keypoint not in xtick_positions:
+                continue
+            x_pos = xtick_positions[keypoint]
+            ax.scatter(
+                x_pos,
+                row["Error_Threshold"],
+                marker="D",
+                s=34,
+                color="red",
+                edgecolor="black",
+                linewidth=0.4,
+                zorder=5,
+                label="threshold" if first_label else None
+            )
+            ax.text(
+                x_pos + 0.08,
+                row["Error_Threshold"],
+                f"{row['Error_Threshold']:.2g}",
+                color="red",
+                fontsize=7,
+                ha="left",
+                va="center",
+                rotation=90,
+                zorder=6
+            )
+            first_label = False
+        ax.set_title("Keypoint tracking error thresholds")
+        ax.set_xlabel("Keypoint")
+        ax.set_ylabel("Tracking/reconstruction error")
+        ax.tick_params(axis="x", rotation=90)
+        ax.legend(frameon=False, title="Contact group", loc="center left", bbox_to_anchor=(1.0, 0.5))
+        sns.despine()
+        plt.tight_layout(rect=[0, 0, 0.86, 1])
+
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            if save_csv:
+                threshold_df.to_csv(f"{file_name}_thresholds.csv", index=False)
+                qc_df.to_csv(f"{file_name}_data.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        plt.close(fig)
+        return fig, ax, threshold_df, qc_df, skipped_df
+
+    def plot_single_trial_tracking_quality_over_time(
+            self,
+            groups,
+            group_name,
+            fly_number,
+            trial_number,
+            keypoint=None,
+            keypoints=None,
+            trial_types=("Landing", "Flying", "NF", "NA"),
+            tau=0.71,
+            margin_s=0.2,
+            min_cameras=2,
+            max_error=None,
+            x_axis="frame",
+            frame_number_base=0,
+            file_name=None,
+            save_csv=True
+    ):
+        """
+        Plot one keypoint's tracking error and camera count over time for one
+        trial. Time is aligned to MOC and restricted to the analysis window plus
+        margin. The shaded span marks MOC->MOL for success or MOC->MOC+tau for
+        failed/flying.
+        """
+        if x_axis not in {"frame", "time"}:
+            raise ValueError("x_axis must be 'frame' or 'time'.")
+        if keypoint is None:
+            if keypoints is None:
+                raise ValueError("Provide keypoint as a string, or keypoints with one entry.")
+            keypoint_order = list(keypoints)
+            if len(keypoint_order) != 1:
+                raise ValueError("plot_single_trial_tracking_quality_over_time now plots one specified keypoint.")
+            keypoint = keypoint_order[0]
+
+        if isinstance(groups, dict):
+            if group_name in groups:
+                group_info = groups[group_name]
+            else:
+                matches = [group for group in groups.values() if group.group_name == group_name]
+                if len(matches) != 1:
+                    raise KeyError(f"Could not resolve group_name '{group_name}' from groups.")
+                group_info = matches[0]
+        else:
+            group_info = groups
+            if group_name not in {None, group_info.group_name}:
+                raise ValueError(f"Provided group is '{group_info.group_name}', not '{group_name}'.")
+
+        if len(group_info.trial_metadata) == 0:
+            group_info.initialize_manual_data()
+
+        key = group_info._trial_key(fly_number, trial_number)
+        if key not in group_info.trial_metadata:
+            raise ValueError(f"No metadata found for {group_info.group_name} F{fly_number}T{trial_number}.")
+
+        meta = group_info.trial_metadata[key]
+        read_types = list(dict.fromkeys(list(trial_types) + [meta["TrialType"]]))
+        group_info.read_kinematic_data(read_types)
+        if key not in group_info.fly_kinematic_data:
+            raise ValueError(
+                f"No kinematic data found for {group_info.group_name} F{fly_number}T{trial_number} "
+                f"(TrialType={meta['TrialType']})."
+            )
+
+        trial_info = group_info.fly_kinematic_data[key]
+        if keypoint not in trial_info.trial_data:
+            raise ValueError(f"Keypoint '{keypoint}' was not found in F{fly_number}T{trial_number}.")
+
+        moc = trial_info.moc
+        mol = trial_info.mol
+        fps = trial_info.fps
+        if pd.isna(moc) or pd.isna(fps):
+            raise ValueError(f"F{fly_number}T{trial_number} is missing MOC or FPS; cannot align the QC plot.")
+
+        moc = int(moc)
+        fps = float(fps)
+        ll = meta["LL"]
+        is_success = (
+                meta["TrialType"] == "Landing"
+                and not pd.isna(ll)
+                and ll != -1
+                and (ll / fps) <= group_info.latency_threshold
+        )
+        if is_success and not pd.isna(mol) and mol > moc:
+            analysis_end = int(min(mol, trial_info.total_frames_number - 1))
+            endpoint_rule = "MOL"
+            outcome = "Success"
+        else:
+            analysis_end = int(min(moc + tau * fps, trial_info.total_frames_number - 1))
+            endpoint_rule = "MOC_plus_tau"
+            outcome = "Failed"
+
+        if analysis_end <= moc:
+            raise ValueError(
+                f"F{fly_number}T{trial_number} has an empty analysis window "
+                f"(MOC={moc}, analysis_end={analysis_end})."
+            )
+
+        margin_frames = int(round(margin_s * fps))
+        qc_start = max(0, moc - margin_frames)
+        qc_stop = min(trial_info.total_frames_number - 1, analysis_end + margin_frames)
+
+        point = trial_info.trial_data[keypoint]
+        x = np.asarray(point.x_coord, dtype=float)
+        y = np.asarray(point.y_coord, dtype=float)
+        z = np.asarray(point.z_coord, dtype=float)
+        camera_count = np.asarray(point.camera_count, dtype=float)
+        error = np.asarray(point.error, dtype=float)
+
+        rows = []
+        for frame in range(qc_start, qc_stop + 1):
+            finite_coord = np.isfinite(x[frame]) and np.isfinite(y[frame]) and np.isfinite(z[frame])
+            finite_error = np.isfinite(error[frame])
+            camera_ok = np.isfinite(camera_count[frame]) and camera_count[frame] >= min_cameras
+            error_ok = True if max_error is None else (finite_error and error[frame] <= max_error)
+            rows.append({
+                "Group_Name": group_info.group_name,
+                "Index": str((fly_number, trial_number)),
+                "CSV_Path": trial_info.data_path,
+                "Fly#": fly_number,
+                "Trial#": trial_number,
+                "TrialType": meta["TrialType"],
+                "Outcome": outcome,
+                "Keypoint": keypoint,
+                "Frame": frame,
+                "Frame_0based": frame,
+                "Frame_1based": frame + 1,
+                "Display_Frame": frame + frame_number_base,
+                "Time_From_MOC_s": (frame - moc) / fps,
+                "In_Analysis_Window": moc <= frame <= analysis_end,
+                "Analysis_Start_Frame": moc,
+                "Analysis_End_Frame": analysis_end,
+                "Endpoint_Rule": endpoint_rule,
+                "QC_Start_Frame": qc_start,
+                "QC_Stop_Frame": qc_stop,
+                "Camera_Count": camera_count[frame],
+                "Error": error[frame],
+                "Finite_Coordinates": finite_coord,
+                "Finite_Error": finite_error,
+                "Camera_OK": camera_ok,
+                "Error_OK": error_ok,
+                "Valid_QC_Frame": finite_coord and camera_ok and error_ok,
+                "Min_Cameras": min_cameras,
+                "Max_Error": max_error,
+                "Tau_s": tau,
+                "Margin_s": margin_s,
+            })
+
+        trial_df = pd.DataFrame(rows).sort_values("Time_From_MOC_s")
+        skipped_df = pd.DataFrame()
+        if x_axis == "frame":
+            x_values = trial_df["Display_Frame"]
+            analysis_start_x = moc + frame_number_base
+            analysis_stop_x = analysis_end + frame_number_base
+            moc_x = moc + frame_number_base
+            xlabel = f"Frame ({frame_number_base}-based)"
+            secondary_location = "top"
+            secondary_functions = (
+                lambda frame: (frame - frame_number_base - moc) / fps,
+                lambda time_s: time_s * fps + moc + frame_number_base
+            )
+            secondary_label = "Time from MOC (s)"
+        else:
+            x_values = trial_df["Time_From_MOC_s"]
+            analysis_start_x = (moc - moc) / fps
+            analysis_stop_x = (analysis_end - moc) / fps
+            moc_x = 0
+            xlabel = "Time from MOC (s)"
+            secondary_location = "top"
+            secondary_functions = (
+                lambda time_s: time_s * fps + moc + frame_number_base,
+                lambda frame: (frame - frame_number_base - moc) / fps
+            )
+            secondary_label = f"Frame ({frame_number_base}-based)"
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+        axes[0].plot(
+            x_values,
+            trial_df["Error"],
+            color="black",
+            linewidth=1.4,
+            label=keypoint
+        )
+        axes[1].scatter(
+            x_values,
+            trial_df["Camera_Count"],
+            color="black",
+            s=16,
+            alpha=0.85,
+            label=keypoint
+        )
+
+        analysis = trial_df[trial_df["In_Analysis_Window"]]
+        if not analysis.empty:
+            for ax in axes:
+                ax.axvspan(analysis_start_x, analysis_stop_x, color="0.9", zorder=0)
+        for ax in axes:
+            ax.axvline(moc_x, color="black", linestyle="--", linewidth=0.9)
+        if max_error is not None:
+            axes[0].axhline(max_error, color="red", linestyle="--", linewidth=0.9, label="max error")
+        axes[1].axhline(min_cameras, color="red", linestyle="--", linewidth=0.9, label="min cameras")
+
+        axes[0].set_ylabel("Tracking/reconstruction error")
+        axes[1].set_ylabel("Camera count")
+        axes[1].set_xlabel(xlabel)
+        secondary_axis = axes[0].secondary_xaxis(secondary_location, functions=secondary_functions)
+        secondary_axis.set_xlabel(secondary_label)
+        outcome = trial_df["Outcome"].iloc[0]
+        endpoint_rule = trial_df["Endpoint_Rule"].iloc[0]
+        axes[0].set_title(
+            f"{group_name} F{fly_number}T{trial_number} {keypoint}: tracking quality over time "
+            f"({outcome}, endpoint={endpoint_rule})"
+        )
+
+        axes[0].legend(frameon=False, loc="upper right")
+        sns.despine()
+        fig.tight_layout()
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            if save_csv:
+                trial_df.to_csv(f"{file_name}_data.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        return fig, axes, trial_df, skipped_df
+
     def plot_leg_angle_reaction(self, group_info, index, ax, joint, color):
         self._ensure_trials_loaded(group_info, trial_types=["Landing", "Flying"])
 
@@ -1210,6 +2632,11 @@ class PlotCreator:
             n_perm=20000,
             random_state=0,
             radial_stats_file_name=None,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
             save_csv=True
     ):
         """
@@ -1463,7 +2890,37 @@ class PlotCreator:
                             endpoint_rule = "SLC"
                             slc_frame = int(candidate_slc_frame)
 
-                    xyz = self.calculator.ReadAndTranspose(joint, trial_info).astype(float)
+                    if apply_tracking_qc:
+                        xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
+                            trial_info=trial_info,
+                            keypoint=joint,
+                            min_cameras=min_cameras,
+                            error_thresholds=tracking_error_thresholds,
+                            max_interp_gap_frames=max_interp_gap_frames,
+                            min_valid_fraction=min_valid_fraction,
+                            start_frame=moc,
+                            end_frame=endpoint_frame,
+                            require_start_end_valid=True
+                        )
+                        if not qc_summary["QC_Passed"]:
+                            skipped_rows.append({
+                                "Group_Label": group_label,
+                                "Index": str(index),
+                                "Joint": joint,
+                                "Reason": "failed TT tracking QC",
+                                **qc_summary,
+                            })
+                            continue
+                    else:
+                        xyz = self.calculator.ReadAndTranspose(joint, trial_info).astype(float)
+                        qc_summary = {
+                            "Valid_Frame_Fraction": np.nan,
+                            "Max_Invalid_Gap_Frames": np.nan,
+                            "Interpolated_Frame_Count": np.nan,
+                            "QC_Passed": True,
+                            "QC_Exclusion_Reason": "",
+                        }
+
                     projected_trace = []
                     for frame in range(moc, endpoint_frame + 1):
                         x, y = project_point(xyz[frame], plane_origin, plane_normal, basis_x, basis_y)
@@ -1495,6 +2952,13 @@ class PlotCreator:
                                 "Reference_X_Source": "platform_tip_motion_best_fit_200_250",
                                 "Platform_Motion_Start_Frame": motion_start,
                                 "Platform_Motion_End_Frame": motion_stop,
+                                "Apply_Tracking_QC": apply_tracking_qc,
+                                "Min_Cameras": min_cameras if apply_tracking_qc else np.nan,
+                                "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                                "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
+                                "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                                "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
+                                "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
                             })
 
                     def append_point_row(point_type, frame, x, y, marker):
@@ -1527,6 +2991,13 @@ class PlotCreator:
                             "Axis_Average_Anchor": axis_average_anchor,
                             "Axis_Average_Start_Frame": avg_slice.start,
                             "Axis_Average_End_Frame": avg_slice.stop - 1,
+                            "Apply_Tracking_QC": apply_tracking_qc,
+                            "Min_Cameras": min_cameras if apply_tracking_qc else np.nan,
+                            "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                            "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
+                            "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                            "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
+                            "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
                         })
 
                     for point_type, frame, marker in (
@@ -1918,6 +3389,585 @@ class PlotCreator:
             radial_stats_df.to_csv(f"{radial_stats_output}.csv", index=False)
 
         return fig, axes, point_df, trajectory_df, skipped_df
+
+    def plot_TT_MOC_to_SLC_endpoint_projected_combined(
+            self,
+            group_info,
+            sc_csv_paths,
+            tt_joints=("L-fTT", "L-mTT", "L-hTT"),
+            plane_axis=("R-mBC", "L-mBC"),
+            reference_axis=("R-mBC", "R-hBC"),
+            origin_keypoint="R-mBC",
+            origin_frame="moc",
+            trial_types=("Landing", "Flying"),
+            tau=0.71,
+            axis_average_frames=100,
+            axis_average_anchor="moc",
+            file_name="TT_MOC_to_SLC_endpoint_projected_combined",
+            colors=None,
+            target_fps=250,
+            trajectory_average_mode="absolute_time",
+            normalized_average_points=200,
+            trial_color="0.55",
+            trial_linewidth=0.25,
+            trial_alpha=0.35,
+            fly_linewidth=1.4,
+            fly_alpha=0.95,
+            radial_circle_diameter=None,
+            radial_coordinate_mode="displacement_origin",
+            n_perm=20000,
+            random_state=0,
+            radial_stats_file_name=None,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            save_csv=True
+    ):
+        """
+        Plot projected TT trajectories and radial endpoint displacements in one
+        3x2-style figure: one row per contact group, trajectory at left and
+        MOC-to-endpoint displacement vectors at right.
+
+        Trial-level traces/vectors are light gray. Fly-level averages are
+        colored by TT joint and are resampled to target_fps before averaging
+        each fly's trajectories.
+        """
+        if target_fps <= 0:
+            raise ValueError("target_fps must be > 0.")
+        if trajectory_average_mode not in {"absolute_time", "time_normalized"}:
+            raise ValueError("trajectory_average_mode must be 'absolute_time' or 'time_normalized'.")
+        if normalized_average_points < 2:
+            raise ValueError("normalized_average_points must be >= 2.")
+        if radial_coordinate_mode not in {"displacement_origin", "trajectory_coordinates"}:
+            raise ValueError(
+                "radial_coordinate_mode must be 'displacement_origin' or 'trajectory_coordinates'."
+            )
+        if n_perm < 1:
+            raise ValueError("n_perm must be >= 1.")
+
+        if isinstance(tt_joints, str):
+            tt_joints = (tt_joints,)
+        else:
+            tt_joints = tuple(tt_joints)
+
+        if colors is None:
+            colors = {
+                "L-fTT": "#1f77b4",
+                "L-mTT": "#d62728",
+                "L-hTT": "#2ca02c",
+            }
+        joint_colors = {joint: colors.get(joint, colors.get(joint.replace("TT", ""), "black"))
+                        if isinstance(colors, dict) else colors[i % len(colors)]
+                        for i, joint in enumerate(tt_joints)}
+
+        if isinstance(group_info, dict):
+            group_items = list(group_info.items())
+        elif isinstance(group_info, (list, tuple)):
+            group_items = [(group.group_name, group) for group in group_info]
+        else:
+            group_items = [(group_info.group_name, group_info)]
+
+        old_fig, _, point_df, trajectory_df, skipped_df = self.plot_TT_MOC_to_SLC_endpoint_projected_scatter(
+            group_info=group_info,
+            sc_csv_paths=sc_csv_paths,
+            tt_joints=tt_joints,
+            plane_axis=plane_axis,
+            reference_axis=reference_axis,
+            origin_keypoint=origin_keypoint,
+            origin_frame=origin_frame,
+            trial_types=trial_types,
+            tau=tau,
+            axis_average_frames=axis_average_frames,
+            axis_average_anchor=axis_average_anchor,
+            file_name=None,
+            colors=colors,
+            show_trajectories=True,
+            show_points=True,
+            show_aep=False,
+            show_vep=False,
+            plot_radial_displacement=False,
+            apply_tracking_qc=apply_tracking_qc,
+            tracking_error_thresholds=tracking_error_thresholds,
+            min_cameras=min_cameras,
+            max_interp_gap_frames=max_interp_gap_frames,
+            min_valid_fraction=min_valid_fraction,
+            save_csv=False
+        )
+        plt.close(old_fig)
+
+        radial_rows = []
+        radial_group_cols = ["Group_Label", "Index", "Fly#", "Trial#", "Joint", "Leg"]
+        for group_keys, sub in point_df.groupby(radial_group_cols):
+            start = sub[sub["Point_Type"] == "MOC"]
+            end = sub[sub["Point_Type"] == "Endpoint"]
+            if start.empty or end.empty:
+                continue
+            start = start.iloc[0]
+            end = end.iloc[0]
+            dx = float(end["Projected_X"] - start["Projected_X"])
+            dy = float(end["Projected_Y"] - start["Projected_Y"])
+            radial_rows.append({
+                "Group_Label": group_keys[0],
+                "Index": group_keys[1],
+                "Fly#": group_keys[2],
+                "Trial#": group_keys[3],
+                "Joint": group_keys[4],
+                "Leg": group_keys[5],
+                "Group_Name": end["Group_Name"],
+                "Outcome": end["Outcome"],
+                "TrialType": end["TrialType"],
+                "Displacement_X": dx,
+                "Displacement_Y": dy,
+                "Displacement_Magnitude": float(np.hypot(dx, dy)),
+                "Displacement_Angle_Deg": float(np.degrees(np.arctan2(dy, dx))),
+                "Endpoint_Frame": end["Endpoint_Frame"],
+                "Endpoint_Rule": end["Endpoint_Rule"],
+                "SLC_Frame": end["SLC_Frame"],
+                "SLC_Valid_For_Window": end["SLC_Valid_For_Window"],
+            })
+        radial_df = pd.DataFrame(radial_rows)
+
+        def fly_average_trajectories():
+            average_rows = []
+            if trajectory_df.empty:
+                return pd.DataFrame()
+
+            group_cols = ["Group_Label", "Joint", "Leg", "Fly#"]
+            trial_cols = ["Group_Label", "Joint", "Leg", "Fly#", "Trial#"]
+            for fly_keys, fly_df in trajectory_df.groupby(group_cols):
+                prepared = []
+                max_time = 0
+                for _, trial_df in fly_df.groupby(trial_cols):
+                    trial_df = trial_df.sort_values("Time_From_MOC_s")
+                    time_s = trial_df["Time_From_MOC_s"].to_numpy(dtype=float)
+                    x_values = trial_df["Projected_X"].to_numpy(dtype=float)
+                    y_values = trial_df["Projected_Y"].to_numpy(dtype=float)
+                    valid = np.isfinite(time_s) & np.isfinite(x_values) & np.isfinite(y_values)
+                    if np.sum(valid) < 2:
+                        continue
+                    time_s = time_s[valid]
+                    x_values = x_values[valid]
+                    y_values = y_values[valid]
+                    unique_time, unique_idx = np.unique(time_s, return_index=True)
+                    if len(unique_time) < 2:
+                        continue
+                    prepared.append((unique_time, x_values[unique_idx], y_values[unique_idx]))
+                    max_time = max(max_time, float(unique_time[-1]))
+
+                if not prepared or max_time <= 0:
+                    continue
+
+                if trajectory_average_mode == "time_normalized":
+                    average_time = np.linspace(0, 1, normalized_average_points)
+                    x_stack = []
+                    y_stack = []
+                    for time_s, x_values, y_values in prepared:
+                        normalized_time = time_s / time_s[-1]
+                        x_stack.append(np.interp(average_time, normalized_time, x_values))
+                        y_stack.append(np.interp(average_time, normalized_time, y_values))
+
+                    mean_x = np.nanmean(np.asarray(x_stack, dtype=float), axis=0)
+                    mean_y = np.nanmean(np.asarray(y_stack, dtype=float), axis=0)
+                    n_contributing = np.full(len(average_time), len(prepared), dtype=int)
+                    time_unit = "normalized_MOC_to_endpoint"
+                else:
+                    average_time = np.arange(0, max_time + (0.5 / target_fps), 1 / target_fps)
+                    x_stack = []
+                    y_stack = []
+                    for time_s, x_values, y_values in prepared:
+                        in_range = average_time <= time_s[-1]
+                        x_interp = np.full(len(average_time), np.nan, dtype=float)
+                        y_interp = np.full(len(average_time), np.nan, dtype=float)
+                        x_interp[in_range] = np.interp(average_time[in_range], time_s, x_values)
+                        y_interp[in_range] = np.interp(average_time[in_range], time_s, y_values)
+                        x_stack.append(x_interp)
+                        y_stack.append(y_interp)
+
+                    mean_x = np.nanmean(np.asarray(x_stack, dtype=float), axis=0)
+                    mean_y = np.nanmean(np.asarray(y_stack, dtype=float), axis=0)
+                    n_contributing = np.sum(np.isfinite(np.asarray(x_stack, dtype=float)), axis=0)
+                    time_unit = "seconds_from_MOC"
+
+                for time_value, x_value, y_value, n_value in zip(average_time, mean_x, mean_y, n_contributing):
+                    if not np.isfinite(x_value) or not np.isfinite(y_value):
+                        continue
+                    average_rows.append({
+                        "Group_Label": fly_keys[0],
+                        "Joint": fly_keys[1],
+                        "Leg": fly_keys[2],
+                        "Fly#": fly_keys[3],
+                        "Time_From_MOC_s": time_value,
+                        "Mean_Projected_X": x_value,
+                        "Mean_Projected_Y": y_value,
+                        "n_trials_contributing": int(n_value),
+                        "Target_FPS": target_fps,
+                        "Average_Mode": trajectory_average_mode,
+                        "Average_Time_Unit": time_unit,
+                    })
+            return pd.DataFrame(average_rows)
+
+        fly_trajectory_df = fly_average_trajectories()
+        fly_radial_df = pd.DataFrame()
+        if not radial_df.empty:
+            fly_radial_df = (
+                radial_df
+                .groupby(["Group_Label", "Joint", "Leg", "Fly#"], as_index=False)
+                .agg(
+                    Mean_Displacement_X=("Displacement_X", "mean"),
+                    Mean_Displacement_Y=("Displacement_Y", "mean"),
+                    n_trials=("Index", "nunique")
+                )
+            )
+            fly_radial_df["Mean_Displacement_Magnitude"] = np.hypot(
+                fly_radial_df["Mean_Displacement_X"],
+                fly_radial_df["Mean_Displacement_Y"]
+            )
+
+        radial_stats_df = pd.DataFrame()
+        if not fly_radial_df.empty:
+            rng = np.random.default_rng(random_state)
+
+            def vector_permutation_test(vectors_a, vectors_b):
+                vectors_a = np.asarray(vectors_a, dtype=float)
+                vectors_b = np.asarray(vectors_b, dtype=float)
+                valid_a = np.all(np.isfinite(vectors_a), axis=1)
+                valid_b = np.all(np.isfinite(vectors_b), axis=1)
+                vectors_a = vectors_a[valid_a]
+                vectors_b = vectors_b[valid_b]
+                if len(vectors_a) == 0 or len(vectors_b) == 0:
+                    return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
+
+                mean_a = np.mean(vectors_a, axis=0)
+                mean_b = np.mean(vectors_b, axis=0)
+                observed_dx = float(mean_b[0] - mean_a[0])
+                observed_dy = float(mean_b[1] - mean_a[1])
+                observed_distance = float(np.hypot(observed_dx, observed_dy))
+
+                pooled = np.vstack([vectors_a, vectors_b])
+                n_a = len(vectors_a)
+                perm_stats = np.empty(n_perm, dtype=float)
+                for perm_i in range(n_perm):
+                    permuted = pooled[rng.permutation(len(pooled))]
+                    perm_mean_a = np.mean(permuted[:n_a], axis=0)
+                    perm_mean_b = np.mean(permuted[n_a:], axis=0)
+                    perm_stats[perm_i] = np.hypot(
+                        perm_mean_b[0] - perm_mean_a[0],
+                        perm_mean_b[1] - perm_mean_a[1]
+                    )
+
+                p_value = (np.sum(perm_stats >= observed_distance) + 1) / (n_perm + 1)
+                return (
+                    observed_distance,
+                    float(p_value),
+                    observed_dx,
+                    observed_dy,
+                    float(mean_a[0]),
+                    float(mean_a[1]),
+                    float(mean_b[0]),
+                    float(mean_b[1]),
+                )
+
+            def unpaired_or_nan(data_a, data_b, column):
+                values_a = data_a[column].to_numpy(dtype=float)
+                values_b = data_b[column].to_numpy(dtype=float)
+                values_a = values_a[np.isfinite(values_a)]
+                values_b = values_b[np.isfinite(values_b)]
+                if len(values_a) == 0 or len(values_b) == 0:
+                    return np.nan, np.nan
+                return self.calculator._permutation_test_unpaired(
+                    values_a,
+                    values_b,
+                    n_perm=n_perm,
+                    rng=rng
+                )
+
+            stat_rows = []
+            group_labels = [label for label, _ in group_items]
+            for joint in tt_joints:
+                joint_fly_df = fly_radial_df[fly_radial_df["Joint"] == joint]
+                for group_a, group_b in itertools.combinations(group_labels, 2):
+                    data_a = joint_fly_df[joint_fly_df["Group_Label"] == group_a]
+                    data_b = joint_fly_df[joint_fly_df["Group_Label"] == group_b]
+                    vectors_a = data_a[["Mean_Displacement_X", "Mean_Displacement_Y"]].to_numpy(dtype=float)
+                    vectors_b = data_b[["Mean_Displacement_X", "Mean_Displacement_Y"]].to_numpy(dtype=float)
+                    (
+                        observed_vector_distance,
+                        vector_p,
+                        observed_dx,
+                        observed_dy,
+                        group_a_mean_x,
+                        group_a_mean_y,
+                        group_b_mean_x,
+                        group_b_mean_y,
+                    ) = vector_permutation_test(vectors_a, vectors_b)
+
+                    x_diff, x_p = unpaired_or_nan(data_a, data_b, "Mean_Displacement_X")
+                    y_diff, y_p = unpaired_or_nan(data_a, data_b, "Mean_Displacement_Y")
+                    magnitude_diff, magnitude_p = unpaired_or_nan(
+                        data_a,
+                        data_b,
+                        "Mean_Displacement_Magnitude"
+                    )
+
+                    stat_rows.append({
+                        "Joint": joint,
+                        "Leg": joint.replace("TT", ""),
+                        "Group_A": group_a,
+                        "Group_B": group_b,
+                        "Test": "fly_mean_vector_label_shuffle",
+                        "Primary_Statistic": "distance_between_group_mean_vectors",
+                        "Observed_Vector_Distance": observed_vector_distance,
+                        "Vector_Permutation_P": vector_p,
+                        "Observed_Delta_X_GroupB_minus_GroupA": observed_dx,
+                        "Observed_Delta_Y_GroupB_minus_GroupA": observed_dy,
+                        "Group_A_Mean_X": group_a_mean_x,
+                        "Group_A_Mean_Y": group_a_mean_y,
+                        "Group_B_Mean_X": group_b_mean_x,
+                        "Group_B_Mean_Y": group_b_mean_y,
+                        "Secondary_X_Mean_Diff_GroupB_minus_GroupA": x_diff,
+                        "Secondary_X_Permutation_P": x_p,
+                        "Secondary_Y_Mean_Diff_GroupB_minus_GroupA": y_diff,
+                        "Secondary_Y_Permutation_P": y_p,
+                        "Secondary_Magnitude_Mean_Diff_GroupB_minus_GroupA": magnitude_diff,
+                        "Secondary_Magnitude_Permutation_P": magnitude_p,
+                        "Group_A_n_flies": int(data_a["Fly#"].nunique()),
+                        "Group_B_n_flies": int(data_b["Fly#"].nunique()),
+                        "Group_A_n_trials": int(data_a["n_trials"].sum()) if not data_a.empty else 0,
+                        "Group_B_n_trials": int(data_b["n_trials"].sum()) if not data_b.empty else 0,
+                        "n_perm": n_perm,
+                        "random_state": random_state,
+                    })
+            radial_stats_df = pd.DataFrame(stat_rows)
+
+        fig, axes = plt.subplots(
+            len(group_items),
+            2,
+            figsize=(10.5, max(4.0, 3.6 * len(group_items))),
+            squeeze=False
+        )
+
+        for row_i, (group_label, _) in enumerate(group_items):
+            traj_ax = axes[row_i, 0]
+            radial_ax = axes[row_i, 1]
+
+            group_traj = trajectory_df[trajectory_df["Group_Label"] == group_label]
+            for _, trial_df in group_traj.groupby(["Joint", "Fly#", "Trial#"]):
+                trial_df = trial_df.sort_values("Frame")
+                traj_ax.plot(
+                    trial_df["Projected_X"],
+                    trial_df["Projected_Y"],
+                    color=trial_color,
+                    linewidth=trial_linewidth,
+                    alpha=trial_alpha,
+                    zorder=1
+                )
+
+            group_fly_traj = fly_trajectory_df[fly_trajectory_df["Group_Label"] == group_label]
+            for (joint, fly_num), fly_df in group_fly_traj.groupby(["Joint", "Fly#"]):
+                fly_df = fly_df.sort_values("Time_From_MOC_s")
+                traj_ax.plot(
+                    fly_df["Mean_Projected_X"],
+                    fly_df["Mean_Projected_Y"],
+                    color=joint_colors[joint],
+                    linewidth=fly_linewidth,
+                    alpha=fly_alpha,
+                    zorder=3
+                )
+
+            group_radial = radial_df[radial_df["Group_Label"] == group_label]
+            for _, row in group_radial.iterrows():
+                if radial_coordinate_mode == "trajectory_coordinates":
+                    point_sub = point_df[
+                        (point_df["Group_Label"] == row["Group_Label"])
+                        & (point_df["Index"] == row["Index"])
+                        & (point_df["Joint"] == row["Joint"])
+                    ]
+                    start_point = point_sub[point_sub["Point_Type"] == "MOC"]
+                    end_point = point_sub[point_sub["Point_Type"] == "Endpoint"]
+                    if start_point.empty or end_point.empty:
+                        continue
+                    start_x = float(start_point.iloc[0]["Projected_X"])
+                    start_y = float(start_point.iloc[0]["Projected_Y"])
+                    end_x = float(end_point.iloc[0]["Projected_X"])
+                    end_y = float(end_point.iloc[0]["Projected_Y"])
+                else:
+                    start_x = 0.0
+                    start_y = 0.0
+                    end_x = float(row["Displacement_X"])
+                    end_y = float(row["Displacement_Y"])
+                radial_ax.plot(
+                    [start_x, end_x],
+                    [start_y, end_y],
+                    color=trial_color,
+                    linewidth=trial_linewidth,
+                    alpha=trial_alpha,
+                    zorder=1
+                )
+
+            group_fly_radial = fly_radial_df[fly_radial_df["Group_Label"] == group_label]
+            for _, row in group_fly_radial.iterrows():
+                color = joint_colors[row["Joint"]]
+                if radial_coordinate_mode == "trajectory_coordinates":
+                    fly_point_sub = point_df[
+                        (point_df["Group_Label"] == row["Group_Label"])
+                        & (point_df["Joint"] == row["Joint"])
+                        & (point_df["Fly#"] == row["Fly#"])
+                    ]
+                    fly_moc = fly_point_sub[fly_point_sub["Point_Type"] == "MOC"]
+                    if fly_moc.empty:
+                        continue
+                    start_x = float(fly_moc["Projected_X"].mean())
+                    start_y = float(fly_moc["Projected_Y"].mean())
+                    end_x = start_x + float(row["Mean_Displacement_X"])
+                    end_y = start_y + float(row["Mean_Displacement_Y"])
+                else:
+                    start_x = 0.0
+                    start_y = 0.0
+                    end_x = float(row["Mean_Displacement_X"])
+                    end_y = float(row["Mean_Displacement_Y"])
+                radial_ax.plot(
+                    [start_x, end_x],
+                    [start_y, end_y],
+                    color=color,
+                    linewidth=fly_linewidth,
+                    alpha=fly_alpha,
+                    zorder=3
+                )
+                radial_ax.scatter(
+                    end_x,
+                    end_y,
+                    color=color,
+                    s=14,
+                    edgecolors="none",
+                    zorder=4
+                )
+
+            for ax in (traj_ax, radial_ax):
+                ax.axhline(0, color="0.86", linewidth=0.7, zorder=0)
+                ax.axvline(0, color="0.86", linewidth=0.7, zorder=0)
+                ax.set_aspect("equal", adjustable="box")
+
+            if radial_circle_diameter is not None:
+                radial_ax.add_patch(
+                    plt.Circle(
+                        (0, 0),
+                        radial_circle_diameter / 2,
+                        fill=False,
+                        edgecolor="0.65",
+                        linewidth=0.9,
+                        zorder=0
+                    )
+                )
+
+            traj_ax.set_ylabel(group_label)
+            if row_i == 0:
+                traj_ax.set_title("Projected TT trajectory")
+                radial_ax.set_title("MOC-to-endpoint displacement")
+            count_lines = []
+            for joint in tt_joints:
+                joint_traj = group_traj[group_traj["Joint"] == joint]
+                n_joint_trials = joint_traj[["Fly#", "Trial#"]].drop_duplicates().shape[0]
+                n_joint_flies = joint_traj["Fly#"].nunique()
+                count_lines.append(f"{joint}: {n_joint_trials} tr, {n_joint_flies} flies")
+            traj_ax.text(
+                0.98,
+                0.96,
+                "\n".join(count_lines),
+                transform=traj_ax.transAxes,
+                ha="right",
+                va="top",
+                fontsize=8
+            )
+
+        axes[-1, 0].set_xlabel(f"Projected X from {origin_keypoint}")
+        radial_xlabel = "Projected X from {0}".format(origin_keypoint) if radial_coordinate_mode == "trajectory_coordinates" else "Displacement X"
+        radial_ylabel = "Projected Y" if radial_coordinate_mode == "trajectory_coordinates" else "Displacement Y"
+        axes[-1, 1].set_xlabel(radial_xlabel)
+        for row_i in range(len(group_items)):
+            axes[row_i, 0].set_ylabel(f"{group_items[row_i][0]}\nProjected Y")
+            axes[row_i, 1].set_ylabel(radial_ylabel)
+
+        axis_values = []
+        for group_label, _ in group_items:
+            group_traj = trajectory_df[trajectory_df["Group_Label"] == group_label]
+            group_radial = radial_df[radial_df["Group_Label"] == group_label]
+            if not group_traj.empty:
+                axis_values.extend(group_traj["Projected_X"].to_numpy(dtype=float))
+                axis_values.extend(group_traj["Projected_Y"].to_numpy(dtype=float))
+            if not group_radial.empty:
+                if radial_coordinate_mode == "trajectory_coordinates":
+                    group_points = point_df[
+                        (point_df["Group_Label"] == group_label)
+                        & point_df["Point_Type"].isin(["MOC", "Endpoint"])
+                    ]
+                    axis_values.extend(group_points["Projected_X"].to_numpy(dtype=float))
+                    axis_values.extend(group_points["Projected_Y"].to_numpy(dtype=float))
+                else:
+                    axis_values.extend([0.0])
+                    axis_values.extend(group_radial["Displacement_X"].to_numpy(dtype=float))
+                    axis_values.extend(group_radial["Displacement_Y"].to_numpy(dtype=float))
+
+        axis_values = np.asarray(axis_values, dtype=float)
+        axis_values = axis_values[np.isfinite(axis_values)]
+        if len(axis_values) == 0:
+            shared_min, shared_max = -0.5, 0.5
+        else:
+            shared_min = float(np.nanmin(axis_values))
+            shared_max = float(np.nanmax(axis_values))
+            if radial_coordinate_mode == "displacement_origin":
+                shared_min = min(shared_min, 0.0)
+                shared_max = max(shared_max, 0.0)
+            if radial_circle_diameter is not None:
+                radius = radial_circle_diameter / 2
+                shared_min = min(shared_min, -radius)
+                shared_max = max(shared_max, radius)
+            if not np.isfinite(shared_min) or not np.isfinite(shared_max) or shared_min == shared_max:
+                shared_min, shared_max = -0.5, 0.5
+
+        axis_pad = max((shared_max - shared_min) * 0.06, 0.05)
+        tick_step = 0.5
+        shared_min = math.floor((shared_min - axis_pad) / tick_step) * tick_step
+        shared_max = math.ceil((shared_max + axis_pad) / tick_step) * tick_step
+        if shared_min == shared_max:
+            shared_min -= tick_step
+            shared_max += tick_step
+        shared_lim = (shared_min, shared_max)
+        shared_ticks = np.arange(shared_min, shared_max + tick_step * 0.5, tick_step)
+        for ax in axes.flatten():
+            ax.set_xlim(shared_lim)
+            ax.set_ylim(shared_lim)
+            ax.set_xticks(shared_ticks)
+            ax.set_yticks(shared_ticks)
+
+        handles = [
+            plt.Line2D([0], [0], color=joint_colors[joint], linewidth=fly_linewidth, label=joint)
+            for joint in tt_joints
+        ]
+        handles.append(plt.Line2D([0], [0], color=trial_color, linewidth=trial_linewidth, label="trial"))
+        axes[0, 1].legend(handles=handles, frameon=True, fontsize=8, loc="best")
+
+        fig.suptitle(
+            f"Projected TT trajectories and endpoint displacement using {plane_axis[0]}->{plane_axis[1]} normal"
+        )
+        sns.despine()
+        fig.tight_layout()
+
+        if file_name is not None:
+            fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+            if save_csv:
+                point_df.to_csv(f"{file_name}_projected_points.csv", index=False)
+                trajectory_df.to_csv(f"{file_name}_projected_trajectories.csv", index=False)
+                radial_df["Radial_Coordinate_Mode"] = radial_coordinate_mode
+                radial_df.to_csv(f"{file_name}_radial_displacement_data.csv", index=False)
+                fly_trajectory_df.to_csv(f"{file_name}_fly_average_trajectories.csv", index=False)
+                fly_radial_df.to_csv(f"{file_name}_fly_average_radial_displacement.csv", index=False)
+                radial_stats_output = radial_stats_file_name or f"{file_name}_fly_mean_vector_stats"
+                radial_stats_df.to_csv(f"{radial_stats_output}.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_skipped_trials.csv", index=False)
+        plt.close(fig)
+        return fig, axes, point_df, trajectory_df, radial_df, radial_stats_df, skipped_df
 
     def plot_LP_summary(
             self,
@@ -2350,6 +4400,14 @@ class PlotCreator:
             target_fps=250,
             trial_types=("Landing", "Flying"),
             show_sem=True,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=False,
+            smooth_window_frames=5,
+            smooth_polyorder=2,
             save_csv=True
     ):
         """
@@ -2398,7 +4456,7 @@ class PlotCreator:
                 return [f"{leg}CT", f"{leg}FT", f"{leg}TT"]
             raise ValueError(f"Unsupported joint_type: {joint_type}")
 
-        def collect_resampled_traces(group_info, leg, joint_type):
+        def collect_resampled_traces(group_info, leg, joint_type, column_label, contact_group):
             if len(group_info.trial_metadata) == 0:
                 group_info.initialize_manual_data()
 
@@ -2408,16 +4466,34 @@ class PlotCreator:
             angle_def = angle_definition(leg, joint_type)
             joint_name = angle_def[1]
             traces = []
+            qc_rows = []
+            skipped_rows = []
 
             for index in group_info.get_targeted_trials(list(trial_types)):
                 key = group_info._trial_key(index[0], index[1])
                 if key not in group_info.fly_kinematic_data:
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Joint_Type": joint_type,
+                        "Reason": "missing kinematic data",
+                    })
                     continue
 
                 trial_info = group_info.fly_kinematic_data[key]
                 moc = trial_info.moc
                 fps = trial_info.fps
                 if pd.isna(moc) or pd.isna(fps):
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Joint_Type": joint_type,
+                        "Reason": "missing MOC or fps",
+                    })
                     continue
 
                 start_frame = int(round(moc + start_s * fps))
@@ -2426,17 +4502,91 @@ class PlotCreator:
                 # Skip incomplete windows so every averaged trace represents
                 # the same MOC-centered interval.
                 if start_frame < 0 or end_frame >= trial_info.total_frames_number:
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Joint_Type": joint_type,
+                        "Reason": "incomplete MOC-centered window",
+                    })
                     continue
                 if any(point not in trial_info.trial_data for point in angle_def):
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Joint_Type": joint_type,
+                        "Reason": "missing angle keypoint",
+                    })
                     continue
 
-                angle_trace = self.calculator.Calculate_joint_angle(trial_info, [angle_def])[joint_name]
+                angle_result = self.calculator.Calculate_joint_angle(
+                    trial_info,
+                    [angle_def],
+                    apply_tracking_qc=apply_tracking_qc,
+                    tracking_error_thresholds=tracking_error_thresholds,
+                    min_cameras=min_cameras,
+                    max_interp_gap_frames=max_interp_gap_frames,
+                    min_valid_fraction=min_valid_fraction,
+                    smooth_angle=smooth_angle,
+                    smooth_window_frames=smooth_window_frames,
+                    smooth_polyorder=smooth_polyorder,
+                    return_qc=apply_tracking_qc
+                )
+                if apply_tracking_qc:
+                    angle_data, angle_qc_df = angle_result
+                    if not angle_qc_df.empty:
+                        qc_record = angle_qc_df.iloc[0].to_dict()
+                        qc_record.update({
+                            "Column": column_label,
+                            "Contact_Group": contact_group,
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Joint_Type": joint_type,
+                        })
+                        qc_rows.append(qc_record)
+                else:
+                    angle_data = angle_result
+                angle_trace = angle_data[joint_name]
                 source_frames = np.arange(start_frame, end_frame + 1)
                 source_time = (source_frames - moc) / fps
                 source_trace = np.asarray(angle_trace[start_frame:end_frame + 1], dtype=float)
 
                 valid = np.isfinite(source_time) & np.isfinite(source_trace)
+                window_valid_fraction = float(np.mean(valid)) if len(valid) else np.nan
+                max_invalid_gap = max(self.calculator.invalid_gap_lengths(valid), default=0)
+                if apply_tracking_qc and (
+                        window_valid_fraction < min_valid_fraction
+                        or max_invalid_gap > max_interp_gap_frames
+                ):
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "Joint_Type": joint_type,
+                        "Reason": "failed angle tracking QC",
+                        "Valid_Frame_Fraction": window_valid_fraction,
+                        "Max_Invalid_Gap_Frames": max_invalid_gap,
+                        "Min_Valid_Fraction": min_valid_fraction,
+                        "Max_Interp_Gap_Frames": max_interp_gap_frames,
+                    })
+                    continue
                 if np.sum(valid) < 2:
+                    skipped_rows.append({
+                        "Column": column_label,
+                        "Contact_Group": contact_group,
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Joint_Type": joint_type,
+                        "Reason": "fewer than two valid angle samples",
+                    })
                     continue
 
                 resampled = np.interp(
@@ -2454,7 +4604,7 @@ class PlotCreator:
                 baseline_mean = float(np.nanmean(baseline_values))
                 traces.append(resampled - baseline_mean)
 
-            return np.asarray(traces, dtype=float)
+            return np.asarray(traces, dtype=float), pd.DataFrame(qc_rows), pd.DataFrame(skipped_rows)
 
         fig, axes = plt.subplots(
             nrows=2,
@@ -2466,6 +4616,8 @@ class PlotCreator:
         )
 
         summary_rows = []
+        qc_summary_tables = []
+        skipped_tables = []
         plotted_angle_values = []
         for col, column_label in enumerate(column_labels):
             contact_groups = groups_by_column[column_label]
@@ -2475,7 +4627,17 @@ class PlotCreator:
 
                 for contact_group, group_info in contact_groups.items():
                     leg = contact_leg_map[contact_group]
-                    traces = collect_resampled_traces(group_info, leg, joint_type)
+                    traces, angle_qc_df, skipped_df = collect_resampled_traces(
+                        group_info,
+                        leg,
+                        joint_type,
+                        column_label,
+                        contact_group
+                    )
+                    if not angle_qc_df.empty:
+                        qc_summary_tables.append(angle_qc_df)
+                    if not skipped_df.empty:
+                        skipped_tables.append(skipped_df)
                     n_trials = int(traces.shape[0]) if traces.ndim == 2 else 0
 
                     summary_rows.append({
@@ -2492,6 +4654,12 @@ class PlotCreator:
                         "baseline_end_s": 0.0,
                         "baseline_end_inclusive": False,
                         "trace_value": "angle_change_from_pre_MOC_mean_deg",
+                        "apply_tracking_qc": apply_tracking_qc,
+                        "min_cameras": min_cameras if apply_tracking_qc else np.nan,
+                        "max_interp_gap_frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                        "min_valid_fraction": min_valid_fraction if apply_tracking_qc else np.nan,
+                        "smooth_angle": smooth_angle,
+                        "smooth_window_frames": smooth_window_frames if smooth_angle else np.nan,
                     })
 
                     if n_trials == 0:
@@ -2565,8 +4733,13 @@ class PlotCreator:
             plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
 
         summary_df = pd.DataFrame(summary_rows)
+        qc_summary_df = pd.concat(qc_summary_tables, ignore_index=True) if qc_summary_tables else pd.DataFrame()
+        skipped_df = pd.concat(skipped_tables, ignore_index=True) if skipped_tables else pd.DataFrame()
         if save_csv and file_name is not None:
             summary_df.to_csv(f"{file_name}_summary.csv", index=False)
+            if apply_tracking_qc:
+                qc_summary_df.to_csv(f"{file_name}_angle_qc_summary.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_angle_qc_skipped_trials.csv", index=False)
 
         plt.close()
         return fig, axes, summary_df
@@ -3082,6 +5255,14 @@ class PlotCreator:
             min_angle_frames=3,
             use_absolute_angular_velocity=True,
             colors=None,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=False,
+            smooth_window_frames=5,
+            smooth_polyorder=2,
             save_csv=True
     ):
         """
@@ -3167,6 +5348,8 @@ class PlotCreator:
         trial_rows = []
         angle_trace_rows = []
         angular_velocity_rows = []
+        angle_qc_rows = []
+        angle_skipped_rows = []
         for index in group_info.get_targeted_trials(list(trial_types)):
             index_tuple = tuple(index)
             behavior_label = behavior_by_index.get(index_tuple)
@@ -3195,27 +5378,120 @@ class PlotCreator:
             })
 
             if key not in group_info.fly_kinematic_data:
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Reason": "missing kinematic data",
+                })
                 continue
 
             trial_info = group_info.fly_kinematic_data[key]
             moc = trial_info.moc
             fps = trial_info.fps
             if pd.isna(moc) or pd.isna(fps):
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Reason": "missing MOC or fps",
+                })
                 continue
             if any(point not in trial_info.trial_data for point in angle_def):
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Reason": "missing angle keypoint",
+                })
                 continue
 
             start_frame = int(round(moc + angle_start_s * fps))
             end_frame = int(round(moc + angle_end_s * fps))
             if start_frame < 0 or end_frame >= trial_info.total_frames_number or end_frame <= start_frame:
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Reason": "incomplete MOC-centered angle window",
+                })
                 continue
 
-            angle_trace = self.calculator.Calculate_joint_angle(trial_info, [angle_def])[angle_def[1]]
+            angle_result = self.calculator.Calculate_joint_angle(
+                trial_info,
+                [angle_def],
+                apply_tracking_qc=apply_tracking_qc,
+                tracking_error_thresholds=tracking_error_thresholds,
+                min_cameras=min_cameras,
+                max_interp_gap_frames=max_interp_gap_frames,
+                min_valid_fraction=min_valid_fraction,
+                smooth_angle=smooth_angle,
+                smooth_window_frames=smooth_window_frames,
+                smooth_polyorder=smooth_polyorder,
+                return_qc=apply_tracking_qc
+            )
+            if apply_tracking_qc:
+                angle_data, angle_qc_df = angle_result
+                if not angle_qc_df.empty:
+                    qc_record = angle_qc_df.iloc[0].to_dict()
+                    qc_record.update({
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "Behavior_Label": behavior_label,
+                        "Contacted_Leg": contacted_leg,
+                    })
+                    angle_qc_rows.append(qc_record)
+            else:
+                angle_data = angle_result
+            angle_trace = angle_data[angle_def[1]]
             source_frames = np.arange(start_frame, end_frame + 1)
             source_time = (source_frames - moc) / fps
             source_trace = np.asarray(angle_trace[start_frame:end_frame + 1], dtype=float)
             valid = np.isfinite(source_time) & np.isfinite(source_trace)
+            window_valid_fraction = float(np.mean(valid)) if len(valid) else np.nan
+            max_invalid_gap = max(self.calculator.invalid_gap_lengths(valid), default=0)
+            if apply_tracking_qc and (
+                    window_valid_fraction < min_valid_fraction
+                    or max_invalid_gap > max_interp_gap_frames
+            ):
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Contacted_Leg": contacted_leg,
+                    "Joint": angle_def[1],
+                    "Reason": "failed angle tracking QC",
+                    "Valid_Frame_Fraction": window_valid_fraction,
+                    "Max_Invalid_Gap_Frames": max_invalid_gap,
+                    "Min_Valid_Fraction": min_valid_fraction,
+                    "Max_Interp_Gap_Frames": max_interp_gap_frames,
+                })
+                continue
             if np.sum(valid) < min_angle_frames:
+                angle_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Behavior_Label": behavior_label,
+                    "Contacted_Leg": contacted_leg,
+                    "Joint": angle_def[1],
+                    "Reason": "fewer than min_angle_frames valid samples",
+                    "Valid_Sample_Count": int(np.sum(valid)),
+                    "Min_Angle_Frames": min_angle_frames,
+                })
                 continue
 
             resampled_trace = np.interp(
@@ -3237,6 +5513,8 @@ class PlotCreator:
                     "Joint": angle_def[1],
                     "Time_From_MOC_s": time_s,
                     "Angle_deg": angle_value,
+                    "Apply_Tracking_QC": apply_tracking_qc,
+                    "Smooth_Angle": smooth_angle,
                 })
 
             clean_angle = source_trace[valid]
@@ -3258,6 +5536,8 @@ class PlotCreator:
                 "Angle_Start_s": angle_start_s,
                 "Angle_End_s": angle_end_s,
                 "Use_Absolute_Angular_Velocity": use_absolute_angular_velocity,
+                "Apply_Tracking_QC": apply_tracking_qc,
+                "Smooth_Angle": smooth_angle,
             })
 
         trial_df = pd.DataFrame(trial_rows)
@@ -3265,6 +5545,8 @@ class PlotCreator:
             raise ValueError("No IT/OT-labeled Landing/Flying trials were found.")
         angle_trace_df = pd.DataFrame(angle_trace_rows)
         angular_velocity_df = pd.DataFrame(angular_velocity_rows)
+        angle_qc_df = pd.DataFrame(angle_qc_rows)
+        angle_skipped_df = pd.DataFrame(angle_skipped_rows)
 
         fly_lp_df = (
             trial_df
@@ -3320,6 +5602,9 @@ class PlotCreator:
                 angle_trace_df.to_csv(f"{file_name}_FT_angle_traces.csv", index=False)
             if not angular_velocity_df.empty:
                 angular_velocity_df.to_csv(f"{file_name}_FT_angular_velocity.csv", index=False)
+            if apply_tracking_qc:
+                angle_qc_df.to_csv(f"{file_name}_FT_angle_qc_summary.csv", index=False)
+                angle_skipped_df.to_csv(f"{file_name}_FT_angle_qc_skipped_trials.csv", index=False)
 
         def significance_label(p):
             if pd.isna(p):
@@ -4226,10 +6511,9 @@ class PlotCreator:
         Plot fly-wise first secondary-contact probability for each leg.
 
         For each fly, the denominator is the number of valid trials. A leg
-        contributes to secondary contact probability only when it is the first
-        valid SC among the selected legs in that trial. Ties are broken using
-        the order of the legs argument, matching the contact-order probability
-        plot.
+        contributes when it is among the first valid SC events among the
+        selected legs in that trial. If multiple legs share the earliest valid
+        SC time, all tied legs are counted as first contacts.
         """
         import itertools
 
@@ -4287,11 +6571,14 @@ class PlotCreator:
                     for leg, sc_time in leg_times.items()
                     if not pd.isna(sc_time)
                 ]
-                valid_times = sorted(valid_times, key=lambda item: (item[1], legs.index(item[0])))
-                first_leg = valid_times[0][0] if valid_times else None
+                first_time = min((sc_time for _, sc_time in valid_times), default=np.nan)
+                first_legs = {
+                    leg for leg, sc_time in valid_times
+                    if not pd.isna(first_time) and np.isclose(sc_time, first_time, rtol=0, atol=1e-12)
+                }
 
                 for leg in legs:
-                    is_first_sc = leg == first_leg
+                    is_first_sc = leg in first_legs
                     trial_rows.append({
                         "Contact_Group": contact_group,
                         "Group_Name": group_info.group_name,
@@ -4301,6 +6588,8 @@ class PlotCreator:
                         "Leg": leg,
                         "SC_time_after_MOC_s": leg_times[leg],
                         "First_SC": int(is_first_sc),
+                        "First_SC_Tie_Size": len(first_legs),
+                        "Tie_Handling": "all_tied_legs_counted",
                     })
 
         trial_df = pd.DataFrame(trial_rows)
@@ -4319,16 +6608,17 @@ class PlotCreator:
         prob_df["Secondary_Contact_Probability"] = (
                 prob_df["First_SC_Count"] / prob_df["n_trials"]
         )
+        prob_df["First_Contact_Participation_Probability"] = prob_df["Secondary_Contact_Probability"]
 
         def run_permutation(group_a, group_b, comparison_type, group_a_label, group_b_label):
             values_a = (
-                group_a["Secondary_Contact_Probability"]
+                group_a["First_Contact_Participation_Probability"]
                 .astype(float)
                 .dropna()
                 .to_numpy()
             )
             values_b = (
-                group_b["Secondary_Contact_Probability"]
+                group_b["First_Contact_Participation_Probability"]
                 .astype(float)
                 .dropna()
                 .to_numpy()
@@ -4391,7 +6681,7 @@ class PlotCreator:
         sns.stripplot(
             data=prob_df,
             x="Contact_Group",
-            y="Secondary_Contact_Probability",
+            y="First_Contact_Participation_Probability",
             hue="Leg",
             order=list(contact_groups),
             hue_order=list(legs),
@@ -4403,9 +6693,9 @@ class PlotCreator:
             ax=ax
         )
         ax.set_xlabel("Contact group")
-        ax.set_ylabel("Secondary contact probability")
+        ax.set_ylabel("First-contact participation probability")
         ax.set_ylim(-0.05, 1.05)
-        ax.set_title("Fly-wise secondary contact probability")
+        ax.set_title("Fly-wise first-contact participation probability")
         ax.legend(
             frameon=False,
             title="Leg",
@@ -4429,6 +6719,10 @@ class PlotCreator:
             threshold=0.71,
             trial_types=("Landing", "Flying"),
             colors=None,
+            subgroup_width=0.22,
+            jitter=0.035,
+            point_size=28,
+            alpha=0.78,
             save_csv=True
     ):
         """
@@ -4436,80 +6730,112 @@ class PlotCreator:
 
         Success is defined as Landing with LL/fps <= group latency threshold.
         Failed includes flying trials and landing trials above threshold.
+
+        group_info can be one Group, a list/tuple of Groups, or a dict such as
+        {"T1": groups["WT_T1_TTa"], "T2": ..., "T3": ...}. When plotting
+        multiple contact groups, sc_csv_path must be a dict keyed by group label
+        or group name. Contact groups are shown as offset subgroups at each
+        valid-contact count; success is filled and failed is hollow.
         """
+        if isinstance(group_info, dict):
+            group_items = list(group_info.items())
+        elif isinstance(group_info, (list, tuple)):
+            group_items = [(group.group_name, group) for group in group_info]
+        else:
+            group_items = [(group_info.group_name, group_info)]
+
+        if not isinstance(sc_csv_path, dict):
+            if len(group_items) != 1:
+                raise ValueError("sc_csv_path must be a dict when plotting multiple groups.")
+            sc_csv_paths = {group_items[0][0]: sc_csv_path}
+        else:
+            sc_csv_paths = sc_csv_path
+
         if colors is None:
-            colors = {
-                "Success": "tab:blue",
-                "Failed": "tab:red",
-            }
+            palette = sns.color_palette("tab10", len(group_items))
+            colors = {label: palette[i] for i, (label, _) in enumerate(group_items)}
+        elif not isinstance(colors, dict):
+            colors = {label: colors[i % len(colors)] for i, (label, _) in enumerate(group_items)}
+        elif not any(label in colors or group.group_name in colors for label, group in group_items):
+            palette = sns.color_palette("tab10", len(group_items))
+            colors = {label: palette[i] for i, (label, _) in enumerate(group_items)}
 
-        if len(group_info.trial_metadata) == 0:
-            group_info.initialize_manual_data()
-            group_info.filter_nan_fly()
+        def group_color(group_label, group):
+            return colors.get(group_label, colors.get(group.group_name, "black"))
 
-        group_info.read_kinematic_data(list(trial_types))
-
-        sc_df = pd.read_csv(sc_csv_path)
-        required_columns = {"Index", *legs}
-        missing_columns = required_columns.difference(sc_df.columns)
-        if missing_columns:
-            raise ValueError(f"SC CSV is missing required columns: {sorted(missing_columns)}")
-
-        def classify_trial(meta):
+        def classify_trial(group, meta):
             ll = meta["LL"]
             fps = meta["fps"]
-            if meta["TrialType"] == "Landing" and not pd.isna(ll) and ll != -1 and (ll / fps) <= group_info.latency_threshold:
+            if meta["TrialType"] == "Landing" and not pd.isna(ll) and ll != -1 and (ll / fps) <= group.latency_threshold:
                 return "Success"
             return "Failed"
 
         rows = []
-        for _, sc_row in sc_df.iterrows():
-            index = self.calculator.parse_index_cell(sc_row["Index"])
-            key = group_info._trial_key(index[0], index[1])
-            if key not in group_info.fly_kinematic_data or key not in group_info.trial_metadata:
-                continue
+        for group_label, current_group in group_items:
+            path = sc_csv_paths.get(group_label, sc_csv_paths.get(current_group.group_name))
+            if path is None:
+                raise ValueError(f"No SC CSV path provided for group '{group_label}'.")
 
-            trial_info = group_info.fly_kinematic_data[key]
-            meta = group_info.trial_metadata[key]
-            moc = trial_info.moc
-            mol = trial_info.mol
-            fps = trial_info.fps
-            if pd.isna(moc) or pd.isna(fps):
-                continue
+            if len(current_group.trial_metadata) == 0:
+                current_group.initialize_manual_data()
+                current_group.filter_nan_fly()
 
-            ll = meta["LL"]
-            latency_s = np.nan
-            if not pd.isna(ll) and ll != -1:
-                latency_s = ll / meta["fps"]
-            if pd.isna(latency_s):
-                continue
+            current_group.read_kinematic_data(list(trial_types))
 
-            valid_sc_count = 0
-            valid_legs = []
-            for leg in legs:
-                sc_result = self.calculator.validate_sc_timing(
-                    sc_row[leg],
-                    moc,
-                    mol,
-                    fps,
-                    threshold
-                )
-                if sc_result["is_valid"]:
-                    valid_sc_count += 1
-                    valid_legs.append(leg)
+            sc_df = pd.read_csv(path)
+            required_columns = {"Index", *legs}
+            missing_columns = required_columns.difference(sc_df.columns)
+            if missing_columns:
+                raise ValueError(f"{group_label} SC CSV is missing columns: {sorted(missing_columns)}")
 
-            rows.append({
-                "Group_Name": group_info.group_name,
-                "Index": str(index),
-                "Fly#": index[0],
-                "Trial#": index[1],
-                "Outcome": classify_trial(meta),
-                "TrialType": meta["TrialType"],
-                "LL_frame": ll,
-                "Landing_Latency_s": latency_s,
-                "Valid_SC_Count": valid_sc_count,
-                "Valid_SC_Legs": ",".join(valid_legs),
-            })
+            for _, sc_row in sc_df.iterrows():
+                index = self.calculator.parse_index_cell(sc_row["Index"])
+                key = current_group._trial_key(index[0], index[1])
+                if key not in current_group.fly_kinematic_data or key not in current_group.trial_metadata:
+                    continue
+
+                trial_info = current_group.fly_kinematic_data[key]
+                meta = current_group.trial_metadata[key]
+                moc = trial_info.moc
+                mol = trial_info.mol
+                fps = trial_info.fps
+                if pd.isna(moc) or pd.isna(fps):
+                    continue
+
+                ll = meta["LL"]
+                latency_s = np.nan
+                if not pd.isna(ll) and ll != -1:
+                    latency_s = ll / meta["fps"]
+                if pd.isna(latency_s):
+                    continue
+
+                valid_sc_count = 0
+                valid_legs = []
+                for leg in legs:
+                    sc_result = self.calculator.validate_sc_timing(
+                        sc_row[leg],
+                        moc,
+                        mol,
+                        fps,
+                        threshold
+                    )
+                    if sc_result["is_valid"]:
+                        valid_sc_count += 1
+                        valid_legs.append(leg)
+
+                rows.append({
+                    "Contact_Group": group_label,
+                    "Group_Name": current_group.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Outcome": classify_trial(current_group, meta),
+                    "TrialType": meta["TrialType"],
+                    "LL_frame": ll,
+                    "Landing_Latency_s": latency_s,
+                    "Valid_SC_Count": valid_sc_count,
+                    "Valid_SC_Legs": ",".join(valid_legs),
+                })
 
         count_df = pd.DataFrame(rows)
         if count_df.empty:
@@ -4518,31 +6844,81 @@ class PlotCreator:
         if save_csv and file_name is not None:
             count_df.to_csv(f"{file_name}_data.csv", index=False)
 
-        fig, ax = plt.subplots(figsize=(5.2, 4.0))
-        sns.stripplot(
-            data=count_df,
-            x="Valid_SC_Count",
-            y="Landing_Latency_s",
-            hue="Outcome",
-            hue_order=["Success", "Failed"],
-            palette=colors,
-            jitter=0.08,
-            dodge=False,
-            size=5,
-            alpha=0.78,
-            ax=ax
-        )
-        ax.axhline(group_info.latency_threshold, color="black", linestyle="--", linewidth=1)
+        fig, ax = plt.subplots(figsize=(6.2, 4.2))
+        group_labels = [label for label, _ in group_items]
+        if len(group_labels) == 1:
+            offsets = {group_labels[0]: 0.0}
+        else:
+            offsets = {
+                label: offset
+                for label, offset in zip(group_labels, np.linspace(-subgroup_width, subgroup_width, len(group_labels)))
+            }
+
+        rng = np.random.default_rng(0)
+        for group_label, current_group in group_items:
+            color = group_color(group_label, current_group)
+            for outcome, filled in (("Success", True), ("Failed", False)):
+                sub = count_df[
+                    (count_df["Contact_Group"] == group_label)
+                    & (count_df["Outcome"] == outcome)
+                ]
+                if sub.empty:
+                    continue
+                x_values = (
+                    sub["Valid_SC_Count"].to_numpy(dtype=float)
+                    + offsets[group_label]
+                    + rng.uniform(-jitter, jitter, size=len(sub))
+                )
+                ax.scatter(
+                    x_values,
+                    sub["Landing_Latency_s"],
+                    s=point_size,
+                    marker="o",
+                    facecolors=color if filled else "none",
+                    edgecolors=color,
+                    linewidths=0.8,
+                    alpha=alpha,
+                    label=f"{group_label} {outcome}",
+                )
+
+        for _, current_group in group_items:
+            ax.axhline(current_group.latency_threshold, color="0.35", linestyle="--", linewidth=0.8, alpha=0.45)
         ax.set_xlabel("# valid leg contact events per trial")
         ax.set_ylabel("Landing latency (s)")
         ax.set_xticks(range(len(legs) + 1))
         ax.set_xlim(-0.5, len(legs) + 0.5)
-        ax.set_title(f"{group_info.group_name}: valid leg contact count vs landing latency")
+        ax.set_title("Valid leg contact count vs landing latency")
+
+        group_handles = [
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="none",
+                markerfacecolor=group_color(label, group),
+                markeredgecolor=group_color(label, group),
+                label=label,
+            )
+            for label, group in group_items
+        ]
+        outcome_handles = [
+            plt.Line2D([0], [0], marker="o", linestyle="none", color="0.25", markerfacecolor="0.25", label="Success"),
+            plt.Line2D([0], [0], marker="o", linestyle="none", color="0.25", markerfacecolor="none", label="Failed"),
+        ]
+        legend1 = ax.legend(
+            handles=group_handles,
+            frameon=False,
+            title="Contact group",
+            loc="center left",
+            bbox_to_anchor=(1.0, 0.62)
+        )
+        ax.add_artist(legend1)
         ax.legend(
+            handles=outcome_handles,
             frameon=False,
             title="Outcome",
             loc="center left",
-            bbox_to_anchor=(1.0, 0.5)
+            bbox_to_anchor=(1.0, 0.28)
         )
         sns.despine()
         plt.tight_layout(rect=[0, 0, 0.82, 1])
@@ -4567,7 +6943,12 @@ class PlotCreator:
             sc_csv_path=None,
             colors=None,
             save_csv=True,
-            n_perm=20000
+            n_perm=20000,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8
     ):
         """
         Plot left-leg TT path efficiency grouped by outcome and IT/OT behavior.
@@ -4698,6 +7079,7 @@ class PlotCreator:
             return path_efficiency, path_length, displacement
 
         records = []
+        qc_skipped_rows = []
         for index in group_info.get_targeted_trials(list(trial_types)):
             key = group_info._trial_key(index[0], index[1])
             if key not in group_info.fly_kinematic_data or key not in group_info.trial_metadata:
@@ -4741,10 +7123,59 @@ class PlotCreator:
                 if moc_i < 0 or end_frame <= moc_i:
                     continue
 
-                tt_xyz = self.calculator.ReadAndTranspose(tt_point, trial_info)
+                if apply_tracking_qc:
+                    tt_xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
+                        trial_info=trial_info,
+                        keypoint=tt_point,
+                        min_cameras=min_cameras,
+                        error_thresholds=tracking_error_thresholds,
+                        max_interp_gap_frames=max_interp_gap_frames,
+                        min_valid_fraction=min_valid_fraction,
+                        start_frame=moc_i,
+                        end_frame=end_frame,
+                        require_start_end_valid=True
+                    )
+                    if not qc_summary["QC_Passed"]:
+                        qc_skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Leg": leg,
+                            "Keypoint": tt_point,
+                            "Outcome": outcome,
+                            "Reason": "failed TT path tracking QC",
+                            "Analysis_Window_Start_Frame": moc_i,
+                            "Analysis_Window_End_Frame": end_frame,
+                            **qc_summary,
+                        })
+                        continue
+                else:
+                    tt_xyz = self.calculator.ReadAndTranspose(tt_point, trial_info)
+                    qc_summary = {
+                        "Valid_Frame_Fraction": np.nan,
+                        "Max_Invalid_Gap_Frames": np.nan,
+                        "Interpolated_Frame_Count": np.nan,
+                        "QC_Passed": True,
+                        "QC_Exclusion_Reason": "",
+                    }
                 tt_segment = tt_xyz[moc_i:min(end_frame + 1, len(tt_xyz))]
                 path_efficiency, path_length, displacement = compute_path_efficiency(tt_segment)
                 if pd.isna(path_efficiency):
+                    if apply_tracking_qc:
+                        qc_skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Leg": leg,
+                            "Keypoint": tt_point,
+                            "Outcome": outcome,
+                            "Reason": "path efficiency unavailable after tracking QC",
+                            "Analysis_Window_Start_Frame": moc_i,
+                            "Analysis_Window_End_Frame": end_frame,
+                            **qc_summary,
+                        })
                     continue
 
                 records.append({
@@ -4770,9 +7201,17 @@ class PlotCreator:
                     "Analysis_Window_End_Frame": end_frame,
                     "SLC_Frame": slc_frame,
                     "SLC_Valid_For_Window": slc_valid,
+                    "Apply_Tracking_QC": apply_tracking_qc,
+                    "Min_Cameras": min_cameras if apply_tracking_qc else np.nan,
+                    "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                    "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
+                    "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                    "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
+                    "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
                 })
 
         path_df = pd.DataFrame(records)
+        qc_skipped_df = pd.DataFrame(qc_skipped_rows)
         if path_df.empty:
             raise ValueError("No valid left-leg TT path efficiency rows were found.")
 
@@ -4847,6 +7286,8 @@ class PlotCreator:
         if save_csv and file_name is not None:
             path_df.to_csv(f"{file_name}_data.csv", index=False)
             stat_df.to_csv(f"{file_name}_permutation_stats.csv", index=False)
+            if apply_tracking_qc:
+                qc_skipped_df.to_csv(f"{file_name}_tracking_qc_skipped_trials.csv", index=False)
 
         fig, axes = plt.subplots(1, 1, figsize=(6.8, 7.0))
 
@@ -5783,7 +8224,12 @@ class PlotCreator:
             file_name="TT_summary_metrics_vs_LL",
             save_csv=True,
             n_perm=20000,
-            random_state=0
+            random_state=0,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8
     ):
         """
         Plot TT average speed, path efficiency, and path length vs LL.
@@ -5795,6 +8241,7 @@ class PlotCreator:
         """
         rng = np.random.default_rng(random_state)
         records = []
+        qc_skipped_rows = []
         metric_options = {
             "average_speed": {
                 "column": "TT_Average_Speed",
@@ -5950,7 +8397,42 @@ class PlotCreator:
                 if moc_i < 0 or end_frame <= moc_i:
                     continue
 
-                tt_xyz = self.calculator.ReadAndTranspose(point_name, trial_info)
+                if apply_tracking_qc:
+                    tt_xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
+                        trial_info=trial_info,
+                        keypoint=point_name,
+                        min_cameras=min_cameras,
+                        error_thresholds=tracking_error_thresholds,
+                        max_interp_gap_frames=max_interp_gap_frames,
+                        min_valid_fraction=min_valid_fraction,
+                        start_frame=moc_i,
+                        end_frame=end_frame,
+                        require_start_end_valid=True
+                    )
+                    if not qc_summary["QC_Passed"]:
+                        qc_skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Leg": leg,
+                            "Keypoint": point_name,
+                            "Outcome": outcome,
+                            "Reason": "failed TT summary tracking QC",
+                            "Analysis_Window_Start_Frame": moc_i,
+                            "Analysis_Window_End_Frame": end_frame,
+                            **qc_summary,
+                        })
+                        continue
+                else:
+                    tt_xyz = self.calculator.ReadAndTranspose(point_name, trial_info)
+                    qc_summary = {
+                        "Valid_Frame_Fraction": np.nan,
+                        "Max_Invalid_Gap_Frames": np.nan,
+                        "Interpolated_Frame_Count": np.nan,
+                        "QC_Passed": True,
+                        "QC_Exclusion_Reason": "",
+                    }
                 end = min(end_frame + 1, len(tt_xyz))
                 tt_seg = tt_xyz[moc_i:end]
 
@@ -5959,6 +8441,20 @@ class PlotCreator:
                     fps
                 )
                 if all(pd.isna(value) for value in (average_speed, path_efficiency, path_length)):
+                    if apply_tracking_qc:
+                        qc_skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Leg": leg,
+                            "Keypoint": point_name,
+                            "Outcome": outcome,
+                            "Reason": "TT summary metrics unavailable after tracking QC",
+                            "Analysis_Window_Start_Frame": moc_i,
+                            "Analysis_Window_End_Frame": end_frame,
+                            **qc_summary,
+                        })
                     continue
 
                 records.append({
@@ -5985,9 +8481,17 @@ class PlotCreator:
                     "Analysis_Window_End_Frame": end_frame,
                     "SLC_Frame": slc_frame,
                     "SLC_Valid_For_Window": slc_valid,
+                    "Apply_Tracking_QC": apply_tracking_qc,
+                    "Min_Cameras": min_cameras if apply_tracking_qc else np.nan,
+                    "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                    "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
+                    "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                    "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
+                    "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
                 })
 
         metric_df = pd.DataFrame(records)
+        qc_skipped_df = pd.DataFrame(qc_skipped_rows)
         if metric_df.empty:
             print("No valid TT summary metric data found.")
             return None, None, metric_df, pd.DataFrame()
@@ -6073,6 +8577,8 @@ class PlotCreator:
         if save_csv and file_name is not None:
             metric_df.to_csv(f"{file_name}_data.csv", index=False)
             stat_df.to_csv(f"{file_name}_trend_stats.csv", index=False)
+            if apply_tracking_qc:
+                qc_skipped_df.to_csv(f"{file_name}_tracking_qc_skipped_trials.csv", index=False)
 
         palette = {
             "Success": "tab:blue",

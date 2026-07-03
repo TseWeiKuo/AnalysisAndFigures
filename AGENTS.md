@@ -2,16 +2,20 @@
 
 ## Project Structure & Module Organization
 
-This repository contains a Python analysis pipeline for 3D kinematic, landing probability, landing latency, and optogenetic experiments.
+This repository contains Python workflows for 3D kinematic analysis, landing probability, landing latency, secondary-contact summaries, and optogenetic/KIR/ablation figures.
 
-- `analyze3D_kinematics.py`: main runner that builds groups, creates figures, and runs statistical analyses.
-- `group_config.py`: central configuration for absolute data paths, group names, fly counts, FPS, trial counts, offsets, and tracked keypoints.
-- `kinematic_object.py`: data model layer for `Group`, `Trial`, and `Point`; reads manual Excel sheets and prepares LP/LL data.
-- `kinematic_utilities.py`: geometry, angle, leg-search, secondary-contact, and helper analysis routines.
+- `analyze3D_kinematics.py`: active main runner for building groups, plotting figures, and running statistics.
+- `group_config_new.py`: active configuration for data roots, groups, fly counts, trial counts, FPS, offsets, and keypoints.
+- `group_config_old.py`: legacy configuration kept for comparison.
+- `kinematic_object.py`: `Group`, `Trial`, and `Point` data model and data-loading logic.
+- `kinematic_utilities.py`: geometry, angle, contact-search, and helper routines.
 - `KinematicPlot.py`: plotting and figure-generation functions.
-- `survival_stats_runner.py`: LP and survival/RMST statistical comparisons.
+- `survival_stats_runner.py`: landing probability, survival, and RMST statistics.
+- `Data_organization.py`, `KinematicDataOrganization.py`, `RunVideoAnalysis.py`, `projection_overlay.py`, and `VideoManifestGroupSummary.py`: video, manifest, kinematic organization, and overlay utilities.
+- `SC data/`: small secondary-contact CSV inputs used by analysis scripts.
+- `*.ipynb`: figure-building and exploratory notebook workflows.
 
-There is currently no `tests/` directory or packaged asset folder. Raw data and generated outputs live outside this repository in configured Windows paths.
+There is no formal `tests/` directory.
 
 ## Build, Test, and Development Commands
 
@@ -21,47 +25,45 @@ Run the active analysis pipeline:
 python analyze3D_kinematics.py
 ```
 
-Check syntax without executing the full analysis:
+Check Python syntax without running the full analysis:
 
 ```powershell
 python -m py_compile *.py
 ```
 
-Install expected dependencies if your environment is missing them:
+Install expected dependencies when needed:
 
 ```powershell
 pip install numpy pandas matplotlib seaborn scipy scikit-learn openpyxl lifelines natsort
 ```
 
-Outputs are written to hard-coded folders such as `C:\Users\agrawal-admin\Desktop\Landing\Figures` and `C:\Users\agrawal-admin\Desktop\Landing\STAT`.
-
 ## Coding Style & Naming Conventions
 
-Use 4-space indentation. Prefer `snake_case` for functions and variables, and `PascalCase` for classes. Preserve existing public method names, including mixed-case methods such as `Calculate_joint_angle`, because other scripts may call them.
+Use 4-space indentation. Prefer `snake_case` for functions and variables and `PascalCase` for classes. Preserve existing public mixed-case method names such as `Calculate_joint_angle`, because external scripts may call them.
 
-Keep configuration edits in `group_config.py`, plotting changes in `KinematicPlot.py`, statistical changes in `survival_stats_runner.py`, and data-model changes in `kinematic_object.py`.
+Keep changes scoped by responsibility: configuration in `group_config_new.py`, plotting in `KinematicPlot.py`, statistics in `survival_stats_runner.py`, data-model behavior in `kinematic_object.py`, and shared helper logic in `kinematic_utilities.py`.
 
 ## Testing Guidelines
 
-No automated test framework is currently configured. For any code change, at minimum run:
+No automated test framework or coverage requirement is configured. For every code change, run:
 
 ```powershell
 python -m py_compile *.py
 ```
 
-For behavioral changes, run a small active block in `analyze3D_kinematics.py` first and verify the generated CSV or PDF outputs manually.
+For behavioral changes, run the smallest relevant block in `analyze3D_kinematics.py` or the relevant notebook/script, then manually inspect generated CSV, PDF, or figure outputs.
 
 ## Commit & Pull Request Guidelines
 
-No Git history is available in this folder, so no project-specific commit convention can be inferred. Use short, imperative commit messages, for example:
+Use short, imperative commit messages, for example:
 
 ```text
-Fix GTACR ON/OFF latency filtering
+Fix T2 TiTa parser regression
 Add CsChrimson angle trace summary
 ```
 
-Pull requests should describe the analysis change, list affected groups, mention changed paths or thresholds, and include representative output filenames. For plot changes, attach before/after figures when possible.
+Pull requests should describe the analysis change, list affected groups, mention changed paths or thresholds, and include representative output filenames. For plot changes, include before/after figures when practical.
 
 ## Configuration & Data Safety
 
-Do not commit raw experimental data, generated figures, or large CSV outputs unless intentionally publishing results. Treat absolute paths in `group_config.py` as machine-specific configuration and document any required folder layout changes.
+Treat absolute paths in configuration files as machine-specific. Do not commit raw experimental data, generated figure folders, large CSV outputs, or local cache files unless intentionally publishing them.

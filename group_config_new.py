@@ -298,7 +298,7 @@ GROUP_INFO = {
     },
     "WT_T2_TTa": {
         "group_name": "WT-T2-TiTa",
-        "kine_path": r"C:\Users\agrawal-admin\Desktop\TibiaTarsusPlatformODLight-Wayne-2024-10-19\Network-01-18-Test\WT-LP\T2-TiTa",
+        "kine_path": os.path.join(DATA_FOLDER, r"Network-01-18-2026\WT-LP\T2-TiTa"),
         "ll_path": os.path.join(LANDING_DATA_FOLDER, r"WT-LP\T2-TiTa\T2-TiTa-LL.xlsx"),
         "moc_path": os.path.join(LANDING_DATA_FOLDER, r"WT-LP\T2-TiTa\T2-TiTa-MOC.xlsx"),
         "mol_path": os.path.join(LANDING_DATA_FOLDER, r"WT-LP\T2-TiTa\T2-TiTa-MOL.xlsx"),

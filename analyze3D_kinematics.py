@@ -435,7 +435,7 @@ if __name__ == "__main__":
             legs=("L-f", "L-m", "L-h"),
             threshold=0.71,
             n_perm=n_perm,
-            file_name="Figure_2F_WT_TiTa_flywise_secondary_contact_probability"
+            file_name="Figure_2F_WT_TiTa_flywise_first_contact_participation_probability"
         )
 
         # Additional WT plot: TT path efficiency, path length, and average speed
@@ -726,7 +726,7 @@ if __name__ == "__main__":
 
     if RUN_WT_TITA_TT_MOC_ENDPOINT_PROJECTED_SCATTER:
         scatter_dir = use_output_folder(figures_dir, "WT_TiTa_TT_MOC_endpoint_projected_scatter")
-        plotter.plot_TT_MOC_to_SLC_endpoint_projected_scatter(
+        plotter.plot_TT_MOC_to_SLC_endpoint_projected_combined(
             group_info={
                 "T1": groups["WT_T1_TTa"],
                 "T2": groups["WT_T2_TTa"],
@@ -745,20 +745,19 @@ if __name__ == "__main__":
             trial_types=("Landing", "Flying"),
             tau=0.71,
             axis_average_anchor="moc",
-            file_name="WT_TiTa_projected_TT_MOC_to_SLC_or_fallback_endpoint",
-            point_size=8,
-            alpha=0.6,
-            show_trajectories=True,
-            show_points=True,
-            show_aep=False,
-            show_vep=False,
-            extreme_point_size=24,
-            connector_linewidth=0.15,
-            connector_alpha=0.25,
-            plot_radial_displacement=True,
+            file_name="WT_TiTa_projected_TT_MOC_to_SLC_or_fallback_endpoint_combined",
+            target_fps=250,
+            trajectory_average_mode="time_normalized",
+            normalized_average_points=200,
+            trial_color="0.55",
+            trial_linewidth=0.25,
+            trial_alpha=0.35,
+            fly_linewidth=1.4,
+            fly_alpha=0.95,
             radial_circle_diameter=3,
-            radial_linewidth=0.5,
-            radial_alpha=0.35,
+            radial_coordinate_mode="trajectory_coordinates",
+            n_perm=n_perm,
+            random_state=0,
             save_csv=True
         )
         os.chdir(figures_dir)
