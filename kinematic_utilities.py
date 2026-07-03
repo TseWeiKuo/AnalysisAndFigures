@@ -471,6 +471,8 @@ class SimpleCalculation:
             smooth_angle=False,
             smooth_window_frames=5,
             smooth_polyorder=2,
+            qc_start=None,
+            qc_end=None,
             return_qc=False
     ):
         """
@@ -486,6 +488,26 @@ class SimpleCalculation:
             joint_name = ag[1]
             if "wing" in joint_name:
                 collected_angle_data[joint_name] = self.calculate_wing_angle_trace(trial_info)
+                if apply_tracking_qc:
+                    wing_points = ["L-wing", "L-wing-hinge", "R-wing"]
+                    filtered_trace, qc_mask, qc_summary, _ = self.apply_angle_tracking_qc(
+                        trial_info=trial_info,
+                        angle_trace=collected_angle_data[joint_name],
+                        angle_points=wing_points,
+                        min_cameras=min_cameras,
+                        error_thresholds=tracking_error_thresholds,
+                        max_interp_gap_frames=max_interp_gap_frames,
+                        min_valid_fraction=min_valid_fraction,
+                        smooth=smooth_angle,
+                        smooth_window_frames=smooth_window_frames,
+                        smooth_polyorder=smooth_polyorder
+                    )
+                    collected_angle_data[joint_name] = filtered_trace
+                    qc_summary.update({
+                        "Joint": joint_name,
+                        "Angle_Definition": "|".join(wing_points),
+                    })
+                    qc_summaries.append(qc_summary)
             else:
                 if joint_name not in collected_angle_data:
                     collected_angle_data[joint_name] = []
@@ -1305,7 +1327,27 @@ class GroupDataAnalyzer:
     # Angle traces
     # ------------------------------------------------------------
 
-    def Calculate_angle_traces(self, group_info, index_to_iterate, angles, threshold=None, start=-0.3, end=0.5, chrimson=False):
+    def Calculate_angle_traces(
+            self,
+            group_info,
+            index_to_iterate,
+            angles,
+            threshold=None,
+            start=-0.3,
+            end=0.5,
+            chrimson=False,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=False,
+            smooth_window_frames=5,
+            smooth_polyorder=2,
+            qc_start=None,
+            qc_end=None,
+            return_qc=False
+    ):
         """
         Calculate aligned angle traces for a set of trials.
 
@@ -1321,6 +1363,8 @@ class GroupDataAnalyzer:
         collected_data = {}
         for a in angles:
             collected_data[a[1]] = []
+        qc_rows = []
+        skipped_rows = []
         for index in index_to_iterate:
             trial_info = self._get_trial_obj(group_info, index)
 
@@ -1329,9 +1373,41 @@ class GroupDataAnalyzer:
                 MOC = 750
             if MOC < 0:
                 print("Something wrong")
+                skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Joint": "",
+                    "Reason": "invalid alignment frame",
+                    "Alignment_Frame": MOC,
+                })
                 continue
 
-            angs = self.calculator.Calculate_joint_angle(trial_info, angles)
+            angle_result = self.calculator.Calculate_joint_angle(
+                trial_info,
+                angles,
+                apply_tracking_qc=apply_tracking_qc,
+                tracking_error_thresholds=tracking_error_thresholds,
+                min_cameras=min_cameras,
+                max_interp_gap_frames=max_interp_gap_frames,
+                min_valid_fraction=min_valid_fraction,
+                smooth_angle=smooth_angle,
+                smooth_window_frames=smooth_window_frames,
+                smooth_polyorder=smooth_polyorder,
+                return_qc=apply_tracking_qc
+            )
+            if apply_tracking_qc:
+                angs, trial_qc_df = angle_result
+                if not trial_qc_df.empty:
+                    trial_qc_df = trial_qc_df.copy()
+                    trial_qc_df["Index"] = str(index)
+                    trial_qc_df["Fly#"] = index[0]
+                    trial_qc_df["Trial#"] = index[1]
+                    trial_qc_df["Group_Name"] = group_info.group_name
+                    qc_rows.extend(trial_qc_df.to_dict("records"))
+            else:
+                angs = angle_result
 
             for joint in angles:
                 joint_name = joint[1]
@@ -1340,11 +1416,65 @@ class GroupDataAnalyzer:
                 trace_end = int(MOC) + int(end * trial_info.fps)
                 Joint_signal = np.asarray(angs[joint_name][trace_start:trace_end])
 
+                if apply_tracking_qc:
+                    qc_window_start_s = start if qc_start is None else qc_start
+                    qc_window_end_s = end if qc_end is None else qc_end
+                    qc_trace_start = int(MOC) + int(qc_window_start_s * trial_info.fps)
+                    qc_trace_end = int(MOC) + int(qc_window_end_s * trial_info.fps)
+                    qc_trace_start = max(qc_trace_start, trace_start)
+                    qc_trace_end = min(qc_trace_end, trace_end)
+                    qc_start_offset = max(qc_trace_start - trace_start, 0)
+                    qc_end_offset = max(qc_trace_end - trace_start, qc_start_offset)
+                    qc_signal = Joint_signal[qc_start_offset:qc_end_offset]
+                    window_valid = np.isfinite(qc_signal)
+                    window_valid_fraction = float(np.mean(window_valid)) if len(window_valid) else np.nan
+                    window_gaps = self.calculator.invalid_gap_lengths(window_valid) if len(window_valid) else []
+                    max_window_gap = int(max(window_gaps)) if window_gaps else 0
+                    finite_count = int(np.sum(window_valid))
+                    skip_reason = ""
+                    if pd.isna(window_valid_fraction):
+                        skip_reason = "empty plotted window"
+                    elif window_valid_fraction < min_valid_fraction:
+                        skip_reason = "valid_fraction_below_threshold"
+                    elif max_window_gap > max_interp_gap_frames:
+                        skip_reason = "long_invalid_gap"
+                    elif finite_count < 2:
+                        skip_reason = "fewer_than_two_finite_frames"
+                    if skip_reason:
+                        skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Joint": joint_name,
+                            "Angle_Definition": "|".join(joint),
+                            "Reason": skip_reason,
+                            "Alignment_Frame": MOC,
+                            "Trace_Start_Frame": trace_start,
+                            "Trace_End_Frame": trace_end - 1,
+                            "QC_Start_Frame": qc_trace_start,
+                            "QC_End_Frame": qc_trace_end - 1,
+                            "Requested_Start_s": start,
+                            "Requested_End_s": end,
+                            "QC_Start_s": qc_window_start_s,
+                            "QC_End_s": qc_window_end_s,
+                            "Window_Frame_Count": int(len(qc_signal)),
+                            "Finite_Frame_Count": finite_count,
+                            "Window_Valid_Frame_Fraction": window_valid_fraction,
+                            "Window_Max_Invalid_Gap_Frames": max_window_gap,
+                            "Min_Valid_Fraction": min_valid_fraction,
+                            "Max_Interp_Gap_Frames": max_interp_gap_frames,
+                            "Min_Cameras": min_cameras,
+                        })
+                        continue
+
                 if trial_info.fps == 200:
                     target_len = int(round((end - start) * 250))
                     Joint_signal = self.calculator.Normalized_time(Joint_signal, target_len)
 
                 collected_data[joint_name].append(Joint_signal)
+        if return_qc:
+            return collected_data, pd.DataFrame(qc_rows), pd.DataFrame(skipped_rows)
         return collected_data
 
     # ------------------------------------------------------------

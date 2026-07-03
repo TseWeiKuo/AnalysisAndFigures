@@ -1786,7 +1786,17 @@ class PlotCreator:
             end=3,
             condition="ON",
             colors=None,
-            show_sem=True
+            show_sem=True,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=True,
+            smooth_window_frames=5,
+            smooth_polyorder=2,
+            qc_start=0,
+            qc_end=2.0
     ):
         """
         Plot selected CsChrimson ON angle traces in one panel.
@@ -1814,6 +1824,8 @@ class PlotCreator:
         frames = np.arange(int(start * 250), int(end * 250)) / 250
         fig, axes = plt.subplots(2, 1, figsize=(7.0, 7.0), sharex=True)
         stat_rows = []
+        qc_rows = []
+        skipped_rows = []
 
         for group_idx, (group_label, group_info) in enumerate(group_items):
             if len(group_info.trial_metadata) == 0:
@@ -1828,20 +1840,47 @@ class PlotCreator:
                 print(f"No {condition} trials found for {group_info.group_name}")
                 continue
 
-            group_data = self.analyzer.Calculate_angle_traces(
+            angle_result = self.analyzer.Calculate_angle_traces(
                 group_info=group_info,
                 index_to_iterate=index_to_iterate,
                 angles=angles,
                 start=start,
                 end=end,
-                chrimson=True
+                chrimson=True,
+                apply_tracking_qc=apply_tracking_qc,
+                tracking_error_thresholds=tracking_error_thresholds,
+                min_cameras=min_cameras,
+                max_interp_gap_frames=max_interp_gap_frames,
+                min_valid_fraction=min_valid_fraction,
+                smooth_angle=smooth_angle,
+                smooth_window_frames=smooth_window_frames,
+                smooth_polyorder=smooth_polyorder,
+                qc_start=qc_start,
+                qc_end=qc_end,
+                return_qc=apply_tracking_qc
             )
+            if apply_tracking_qc:
+                group_data, group_qc_df, group_skipped_df = angle_result
+                if not group_qc_df.empty:
+                    group_qc_df = group_qc_df.copy()
+                    group_qc_df["Plot_Label"] = group_label
+                    group_qc_df["Condition"] = condition
+                    qc_rows.extend(group_qc_df.to_dict("records"))
+                if not group_skipped_df.empty:
+                    group_skipped_df = group_skipped_df.copy()
+                    group_skipped_df["Plot_Label"] = group_label
+                    group_skipped_df["Condition"] = condition
+                    skipped_rows.extend(group_skipped_df.to_dict("records"))
+            else:
+                group_data = angle_result
 
             color = colors[group_idx % len(colors)]
             for angle_idx, angle_def in enumerate(angles[:2]):
                 ax = axes[angle_idx]
                 joint_name = angle_def[1]
                 traces = group_data.get(joint_name, [])
+                total_trials = len(index_to_iterate)
+                valid_trials = len(traces)
                 if len(traces) == 0:
                     print(f"No valid {condition} trace found for {group_info.group_name}-{joint_name}")
                     continue
@@ -1864,6 +1903,7 @@ class PlotCreator:
                     color=color,
                     linestyle=line_style,
                     linewidth=2.2,
+                    label=f"{group_label} {trace_label} ({valid_trials}/{total_trials})",
                 )
                 if show_sem:
                     ax.fill_between(
@@ -1881,9 +1921,14 @@ class PlotCreator:
                     "Condition": condition,
                     "Joint": joint_name,
                     "Trace_Type": trace_label,
-                    "n_trials": len(traces),
+                    "n_trials": valid_trials,
+                    "total_trials": total_trials,
+                    "valid_total_label": f"{valid_trials}/{total_trials}",
                     "start": start,
                     "end": end,
+                    "qc_start": qc_start,
+                    "qc_end": qc_end,
+                    "Apply_Tracking_QC": bool(apply_tracking_qc),
                 })
 
         from matplotlib.lines import Line2D
@@ -1902,15 +1947,25 @@ class PlotCreator:
                 xlabel="Time from light ON (s)" if axis_idx == 1 else None
             )
         axes[0].set_title(f"Selected CsChrimson {condition} leg and wing angle traces")
-        axes[0].legend(handles=style_handles, frameon=True, fontsize=8, loc="upper right")
+        for ax in axes:
+            handles, labels = ax.get_legend_handles_labels()
+            ax.legend(handles=handles + style_handles, labels=labels + [handle.get_label() for handle in style_handles],
+                      frameon=True, fontsize=7, loc="upper right")
         sns.despine(trim=True)
         plt.tight_layout()
 
         stat_df = pd.DataFrame(stat_rows)
+        qc_df = pd.DataFrame(qc_rows)
+        skipped_df = pd.DataFrame(skipped_rows)
         if file_name is not None:
             fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
             stat_df.to_csv(f"{file_name}_summary.csv", index=False)
+            if apply_tracking_qc:
+                qc_df.to_csv(f"{file_name}_angle_qc_summary.csv", index=False)
+                skipped_df.to_csv(f"{file_name}_angle_qc_skipped_trials.csv", index=False)
         plt.close(fig)
+        if apply_tracking_qc:
+            return fig, axes, stat_df, qc_df, skipped_df
         return fig, axes, stat_df
 
     def plot_chrimson_on_off_latency_km(
@@ -4624,6 +4679,7 @@ class PlotCreator:
 
             for row, (joint_type, ylabel) in enumerate(row_defs):
                 ax = axes[row, col]
+                panel_count_lines = []
 
                 for contact_group, group_info in contact_groups.items():
                     leg = contact_leg_map[contact_group]
@@ -4665,6 +4721,10 @@ class PlotCreator:
                     if n_trials == 0:
                         continue
 
+                    panel_count_lines.append((
+                        f"{contact_group} {leg}: n={n_trials}",
+                        contact_colors.get(contact_group, "black")
+                    ))
                     mean_trace = np.nanmean(traces, axis=0)
                     valid_n = np.sum(np.isfinite(traces), axis=0)
                     sem_trace = np.full_like(mean_trace, np.nan, dtype=float)
@@ -4700,6 +4760,17 @@ class PlotCreator:
                 ax.set_title(f"{column_label}: {joint_type}")
                 ax.set_ylabel(ylabel if col == 0 else "")
                 ax.set_xlabel("Time from MOC (s)" if row == len(row_defs) - 1 else "")
+                for line_i, (count_text, count_color) in enumerate(panel_count_lines):
+                    ax.text(
+                        0.03,
+                        0.95 - line_i * 0.08,
+                        count_text,
+                        transform=ax.transAxes,
+                        color=count_color,
+                        fontsize=8,
+                        ha="left",
+                        va="top",
+                    )
                 self.formatting(
                     ax,
                     xticks=[start_s, 0, end_s],
@@ -5765,6 +5836,7 @@ class PlotCreator:
 
         fig_angle, ax_angle = plt.subplots(figsize=(5.6, 4.0))
         plotted_angle_values = []
+        angle_count_lines = []
         if not angle_trace_df.empty:
             for label in behavior_labels:
                 sub = angle_trace_df[angle_trace_df["Behavior_Label"] == label]
@@ -5788,12 +5860,14 @@ class PlotCreator:
                 )
                 plotted_angle_values.extend([mean_trace, mean_trace - sem_trace, mean_trace + sem_trace])
                 display = behavior_display_names.get(label, label)
+                n_angle_trials = int(traces.shape[0])
+                angle_count_lines.append((f"{display}: n={n_angle_trials}", colors.get(label, "0.5")))
                 ax_angle.plot(
                     time_values,
                     mean_trace,
                     color=colors.get(label, "0.5"),
                     linewidth=2.4,
-                    label=f"{display} (n={traces.shape[0]})"
+                    label=f"{display} (n={n_angle_trials})"
                 )
                 ax_angle.fill_between(
                     time_values,
@@ -5806,8 +5880,20 @@ class PlotCreator:
         ax_angle.axvline(0, color="black", linestyle="--", linewidth=1)
         ax_angle.set_xlabel("Time from MOC (s)")
         ax_angle.set_ylabel(f"{contacted_leg} FT angle (deg)")
-        ax_angle.set_title(f"{group_info.group_name}: IT/OT {contacted_leg} FT angle trace")
+        behavior_title = "/".join(behavior_display_names.get(label, label) for label in behavior_labels)
+        ax_angle.set_title(f"{group_info.group_name}: {behavior_title} {contacted_leg} FT angle trace")
         ax_angle.set_xlim(angle_start_s, angle_end_s)
+        for line_i, (count_text, count_color) in enumerate(angle_count_lines):
+            ax_angle.text(
+                0.03,
+                0.95 - line_i * 0.09,
+                count_text,
+                transform=ax_angle.transAxes,
+                color=count_color,
+                fontsize=8,
+                ha="left",
+                va="top",
+            )
         finite_arrays = [
             np.asarray(values, dtype=float)[np.isfinite(values)]
             for values in plotted_angle_values
@@ -7338,7 +7424,104 @@ class PlotCreator:
 
         return fig, axes, path_df, stat_df
 
-    def plot_chrimson_LP(self, group_info, color="red", threshold=0.71):
+    def _detect_chrimson_wing_mol(
+            self,
+            trial_info,
+            wing_angle_def=None,
+            window_start=750,
+            window_stop=1250,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=True,
+            smooth_window_frames=5,
+            smooth_polyorder=2
+    ):
+        if wing_angle_def is None:
+            wing_angle_def = [["L-wing", "L-wing-hinge", "R-wing"]]
+
+        angle_result = self.calculator.Calculate_joint_angle(
+            trial_info,
+            wing_angle_def,
+            apply_tracking_qc=apply_tracking_qc,
+            tracking_error_thresholds=tracking_error_thresholds,
+            min_cameras=min_cameras,
+            max_interp_gap_frames=max_interp_gap_frames,
+            min_valid_fraction=min_valid_fraction,
+            smooth_angle=smooth_angle,
+            smooth_window_frames=smooth_window_frames,
+            smooth_polyorder=smooth_polyorder,
+            return_qc=apply_tracking_qc
+        )
+        if apply_tracking_qc:
+            angle_data, qc_df = angle_result
+        else:
+            angle_data = angle_result
+            qc_df = pd.DataFrame()
+
+        wing_trace = np.asarray(angle_data["L-wing-hinge"], dtype=float)
+        start = max(int(window_start), 0)
+        stop = min(int(window_stop), len(wing_trace))
+        wing_window = wing_trace[start:stop]
+        finite_window = np.isfinite(wing_window)
+        window_valid_fraction = float(np.mean(finite_window)) if len(finite_window) else np.nan
+        window_gaps = self.calculator.invalid_gap_lengths(finite_window) if len(finite_window) else []
+        max_window_gap = int(max(window_gaps)) if window_gaps else 0
+
+        qc_passed = True
+        exclusion_reason = ""
+        if len(wing_window) == 0:
+            qc_passed = False
+            exclusion_reason = "empty wing detection window"
+        elif apply_tracking_qc:
+            if pd.isna(window_valid_fraction) or window_valid_fraction < min_valid_fraction:
+                qc_passed = False
+                exclusion_reason = "valid_fraction_below_threshold"
+            elif max_window_gap > max_interp_gap_frames:
+                qc_passed = False
+                exclusion_reason = "long_invalid_gap"
+            elif not np.all(finite_window):
+                qc_passed = False
+                exclusion_reason = "unfilled_invalid_frames_in_detection_window"
+
+        if not qc_passed:
+            return -1, {
+                "Wing_QC_Passed": False,
+                "Wing_QC_Exclusion_Reason": exclusion_reason,
+                "Wing_Window_Valid_Fraction": window_valid_fraction,
+                "Wing_Window_Max_Invalid_Gap_Frames": max_window_gap,
+                "Wing_Window_Start_Frame": start,
+                "Wing_Window_Stop_Frame": stop - 1,
+                "Apply_Tracking_QC": bool(apply_tracking_qc),
+            }, qc_df
+
+        mol = self.detector.detect_landing(wing_window)
+        return mol, {
+            "Wing_QC_Passed": True,
+            "Wing_QC_Exclusion_Reason": "",
+            "Wing_Window_Valid_Fraction": window_valid_fraction,
+            "Wing_Window_Max_Invalid_Gap_Frames": max_window_gap,
+            "Wing_Window_Start_Frame": start,
+            "Wing_Window_Stop_Frame": stop - 1,
+            "Apply_Tracking_QC": bool(apply_tracking_qc),
+        }, qc_df
+
+    def plot_chrimson_LP(
+            self,
+            group_info,
+            color="red",
+            threshold=0.71,
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=True,
+            smooth_window_frames=5,
+            smooth_polyorder=2
+    ):
         """
         Plot paired ON/OFF landing probability for Chrimson data.
 
@@ -7378,6 +7561,8 @@ class PlotCreator:
         Fly_ON_LL = []
         Fly_ON_event = []
         Fly_ON_Idx = []
+        wing_qc_rows = []
+        wing_qc_skipped_rows = []
 
         ON_index, OFF_index = group_info.get_ON_OFF_index()
 
@@ -7393,9 +7578,6 @@ class PlotCreator:
 
             for i, index in enumerate(ON_index):
                 trial_info = group_info.fly_kinematic_data[f"F{index[0]}T{index[1]}"]
-
-                wing_angle = self.calculator.Calculate_joint_angle(trial_info, angs)["L-wing-hinge"][750:1250]
-                MOL = self.detector.detect_landing(wing_angle)
                 if trial_info.LL == -1:
                     flying_num += 1
                     Fly_ON_LL.append(threshold)
@@ -7403,7 +7585,35 @@ class PlotCreator:
                     Fly_ON_Idx.append(index[0])
 
                 elif trial_info.LL == 1:
-                    if MOL == -1 or (MOL / 250) > threshold:
+                    MOL, wing_qc_summary, wing_qc_df = self._detect_chrimson_wing_mol(
+                        trial_info,
+                        wing_angle_def=angs,
+                        apply_tracking_qc=apply_tracking_qc,
+                        tracking_error_thresholds=tracking_error_thresholds,
+                        min_cameras=min_cameras,
+                        max_interp_gap_frames=max_interp_gap_frames,
+                        min_valid_fraction=min_valid_fraction,
+                        smooth_angle=smooth_angle,
+                        smooth_window_frames=smooth_window_frames,
+                        smooth_polyorder=smooth_polyorder
+                    )
+                    wing_qc_summary.update({
+                        "Group": group_info.group_name,
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "Condition": "ON",
+                    })
+                    wing_qc_rows.append(wing_qc_summary)
+                    if not wing_qc_df.empty:
+                        wing_qc_df = wing_qc_df.copy()
+                        wing_qc_df["Group"] = group_info.group_name
+                        wing_qc_df["Fly#"] = index[0]
+                        wing_qc_df["Trial#"] = index[1]
+                        wing_qc_df["Condition"] = "ON"
+                        wing_qc_rows.extend(wing_qc_df.to_dict("records"))
+                    if apply_tracking_qc and not wing_qc_summary["Wing_QC_Passed"]:
+                        wing_qc_skipped_rows.append(wing_qc_summary.copy())
+                    elif MOL == -1 or (MOL / 250) > threshold:
                         flying_num += 1
                         Fly_ON_LL.append(threshold)
                         Fly_ON_event.append(0)
@@ -7512,6 +7722,12 @@ class PlotCreator:
             observed_diff, p_val = np.nan, np.nan
 
         paired_df.to_csv(f"{group_info.group_name}-paired_values.csv")
+        if apply_tracking_qc:
+            pd.DataFrame(wing_qc_rows).to_csv(f"{group_info.group_name}-chr-wing-qc-summary.csv", index=False)
+            pd.DataFrame(wing_qc_skipped_rows).to_csv(
+                f"{group_info.group_name}-chr-wing-qc-skipped-trials.csv",
+                index=False
+            )
 
         # ------------------------------------------------------------
         # Plot paired landing probabilities
@@ -7599,7 +7815,8 @@ class PlotCreator:
             "Group": [group_info.group_name] * len(Fly_ON_LL),
             "Latency": Fly_ON_LL,
             "Event": Fly_ON_event,
-            "Fly#": Fly_ON_Idx
+            "Fly#": Fly_ON_Idx,
+            "Apply_Tracking_QC": bool(apply_tracking_qc),
         })
 
         return Fly_ON_LL_data
@@ -7612,7 +7829,15 @@ class PlotCreator:
             n_perm=20000,
             random_state=0,
             intensity_colors=None,
-            mean_color="black"
+            mean_color="black",
+            apply_tracking_qc=False,
+            tracking_error_thresholds=None,
+            min_cameras=2,
+            max_interp_gap_frames=4,
+            min_valid_fraction=0.8,
+            smooth_angle=True,
+            smooth_window_frames=5,
+            smooth_polyorder=2
     ):
         """
         Plot fly-wise CsChrimson landing-probability change.
@@ -7704,15 +7929,44 @@ class PlotCreator:
         angle_defs = [["L-wing", "L-wing-hinge", "R-wing"]]
         delta_rows = []
         stat_rows = []
+        wing_qc_rows = []
+        wing_qc_skipped_rows = []
 
-        def success_after_light_on(trial_info):
-            wing_angle = self.calculator.Calculate_joint_angle(trial_info, angle_defs)["L-wing-hinge"][750:1250]
-            mol = self.detector.detect_landing(wing_angle)
+        def success_after_light_on(trial_info, index, group_label):
             if trial_info.LL == -1:
-                return False
+                return False, False
             if trial_info.LL == 1:
-                return mol != -1 and (mol / 250) <= threshold
-            return False
+                mol, wing_qc_summary, wing_qc_df = self._detect_chrimson_wing_mol(
+                    trial_info,
+                    wing_angle_def=angle_defs,
+                    apply_tracking_qc=apply_tracking_qc,
+                    tracking_error_thresholds=tracking_error_thresholds,
+                    min_cameras=min_cameras,
+                    max_interp_gap_frames=max_interp_gap_frames,
+                    min_valid_fraction=min_valid_fraction,
+                    smooth_angle=smooth_angle,
+                    smooth_window_frames=smooth_window_frames,
+                    smooth_polyorder=smooth_polyorder
+                )
+                wing_qc_summary.update({
+                    "Group": group_label,
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Condition": "ON",
+                })
+                wing_qc_rows.append(wing_qc_summary)
+                if not wing_qc_df.empty:
+                    wing_qc_df = wing_qc_df.copy()
+                    wing_qc_df["Group"] = group_label
+                    wing_qc_df["Fly#"] = index[0]
+                    wing_qc_df["Trial#"] = index[1]
+                    wing_qc_df["Condition"] = "ON"
+                    wing_qc_rows.extend(wing_qc_df.to_dict("records"))
+                if apply_tracking_qc and not wing_qc_summary["Wing_QC_Passed"]:
+                    wing_qc_skipped_rows.append(wing_qc_summary.copy())
+                    return np.nan, True
+                return mol != -1 and (mol / 250) <= threshold, False
+            return np.nan, True
 
         for group_label, group_info in group_items:
             plot_label, genotype, intensity = group_plot_info(group_label)
@@ -7731,9 +7985,12 @@ class PlotCreator:
                 key = f"F{index[0]}T{index[1]}"
                 if key not in group_info.fly_kinematic_data:
                     continue
+                success, skip_trial = success_after_light_on(group_info.fly_kinematic_data[key], index, group_label)
+                if skip_trial:
+                    continue
                 on_rows.append({
                     "Fly#": index[0],
-                    "Success": int(success_after_light_on(group_info.fly_kinematic_data[key])),
+                    "Success": int(success),
                 })
 
             off_rows = []
@@ -7895,6 +8152,9 @@ class PlotCreator:
             fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
             delta_df.to_csv(f"{file_name}_flywise_delta_LP.csv", index=False)
             stat_df.to_csv(f"{file_name}_paired_signflip_stats.csv", index=False)
+            if apply_tracking_qc:
+                pd.DataFrame(wing_qc_rows).to_csv(f"{file_name}_wing_qc_summary.csv", index=False)
+                pd.DataFrame(wing_qc_skipped_rows).to_csv(f"{file_name}_wing_qc_skipped_trials.csv", index=False)
 
         plt.close(fig)
         return fig, ax, delta_df, stat_df
