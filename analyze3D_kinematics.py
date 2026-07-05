@@ -1,9 +1,10 @@
 import os
+import shutil
 import warnings
 
 
 import KinematicPlot as kp
-from group_config_new import build_groups
+from group_config_new import GROUP_INFO, LANDING_DATA_FOLDER, build_groups
 from survival_stats_runner import SurvivalStatsRunner
 import pandas as pd
 import itertools
@@ -11,6 +12,94 @@ import seaborn as sns
 warnings.filterwarnings(action="ignore", category=RuntimeWarning)
 warnings.filterwarnings(action="ignore", category=FutureWarning)
 warnings.filterwarnings(action="ignore", category=UserWarning)
+
+
+def copy_configured_metadata_files(
+        output_root=None,
+        group_keys=None,
+        metadata_fields=("ll_path", "moc_path", "mol_path"),
+        overwrite=True
+):
+    """
+    Copy metadata files listed in group_config_new.py into output_root.
+
+    The copied files keep the same relative folder structure they have under
+    LANDING_DATA_FOLDER, for example:
+    D:\\DataFolder\\WT-LP\\T1-CxTr\\T1-CxTr-LL.xlsx
+    -> CopiedMetadata\\WT-LP\\T1-CxTr\\T1-CxTr-LL.xlsx
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    if output_root is None:
+        output_root = os.path.join(repo_root, "CopiedMetadata")
+
+    if group_keys is None:
+        group_keys = list(GROUP_INFO.keys())
+
+    os.makedirs(output_root, exist_ok=True)
+    manifest_rows = []
+
+    landing_root = os.path.abspath(LANDING_DATA_FOLDER)
+
+    for group_key in group_keys:
+        info = GROUP_INFO[group_key]
+        for field_name in metadata_fields:
+            source_path = info.get(field_name, "NoPath")
+
+            row = {
+                "group_key": group_key,
+                "group_name": info.get("group_name", ""),
+                "metadata_type": field_name.replace("_path", ""),
+                "source_path": source_path,
+                "destination_path": "",
+                "status": "",
+            }
+
+            if source_path in (None, "", "NoPath"):
+                row["status"] = "skipped_no_path"
+                manifest_rows.append(row)
+                continue
+
+            source_abs = os.path.abspath(source_path)
+            if not os.path.isfile(source_abs):
+                row["status"] = "missing_source"
+                manifest_rows.append(row)
+                continue
+
+            try:
+                is_under_landing_root = os.path.commonpath([landing_root, source_abs]) == landing_root
+            except ValueError:
+                is_under_landing_root = False
+
+            if is_under_landing_root:
+                relative_path = os.path.relpath(source_abs, landing_root)
+            else:
+                relative_path = os.path.join(group_key, os.path.basename(source_abs))
+
+            destination_path = os.path.join(output_root, relative_path)
+            row["destination_path"] = destination_path
+
+            if os.path.exists(destination_path) and not overwrite:
+                row["status"] = "skipped_exists"
+                manifest_rows.append(row)
+                continue
+
+            os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+            shutil.copy2(source_abs, destination_path)
+            row["status"] = "copied"
+            manifest_rows.append(row)
+
+    manifest_df = pd.DataFrame(manifest_rows)
+    manifest_path = os.path.join(output_root, "metadata_copy_manifest.csv")
+    manifest_df.to_csv(manifest_path, index=False)
+
+    copied_count = int((manifest_df["status"] == "copied").sum())
+    missing_count = int((manifest_df["status"] == "missing_source").sum())
+    print(f"Copied {copied_count} metadata files into: {output_root}")
+    if missing_count:
+        print(f"Missing source files recorded in manifest: {missing_count}")
+    print(f"Manifest saved to: {manifest_path}")
+
+    return manifest_df
 
 
 
@@ -24,6 +113,24 @@ if __name__ == "__main__":
     figures_dir = os.path.join(repo_root, "Figures")
     sc_data_dir = os.path.join(repo_root, "SC data")
     other_landing_data_dir = os.path.join(repo_root, "LandingData", "Others")
+
+    # ------------------------------------------------------------
+    # Optional utility: copy all configured metadata files
+    # ------------------------------------------------------------
+    # Set RUN_METADATA_COPY = True, then run:
+    # python analyze3D_kinematics.py
+    #
+    # By default this copies LL/MOC/MOL Excel files into:
+    # CopiedMetadata/
+    # while preserving the same folder structure as LANDING_DATA_FOLDER.
+    RUN_METADATA_COPY = True
+    print(repo_root)
+    if RUN_METADATA_COPY:
+        copy_configured_metadata_files(
+            output_root=os.path.join(repo_root, "CopiedMetadata"),
+            overwrite=True
+        )
+        raise SystemExit
 
     # Build all configured groups
     groups = build_groups()
@@ -249,25 +356,6 @@ if __name__ == "__main__":
             pd.concat(ll_results, ignore_index=True).to_csv(f"{out_prefix}_LL_ON_OFF_fly_RMST_stats.csv", index=False)
 
 
-    """plotter.plot_TT_trajectories_moc_origin_projected_plane(
-        group_info={
-            "T1": groups["WT_T1_TTa"],
-            "T2": groups["WT_T2_TTa"],
-            "T3": groups["WT_T3_TTa"],
-        },
-        tt_joints=("L-fTT", "L-mTT", "L-hTT"),
-        plane_axis=("R-mBC", "L-mBC"),
-        reference_axis=("R-mBC", "R-hBC"),
-        average_mode="time_normalized",  # or "time_normalized"
-        target_fps=250,
-        file_name="WT_T1_T2_T3_left_TT_projected_trajectories_tnorm"
-    )"""
-
-
-    r"""test_t2_it_ot_plots_with_old_and_new_kinematic_paths(
-        r"C:\Users\agrawal-admin\Desktop\TibiaTarsusPlatformODLight-Wayne-2024-10-19\Network-01-18-2026\LPAcrossLegsJoints\T2-TiTa",
-        r"D:\TibiaTarsusPlatformODLight-Wayne-2024-10-19\Network-01-18-2026\LPAcrossLegsJoints\T2-TiTa"
-    )"""
 
     # ============================================================
     # WT Figure 2 workflow
@@ -722,7 +810,7 @@ if __name__ == "__main__":
     # ============================================================
     # Opt-in projected TT MOC/end-point scatter test
     # ============================================================
-    RUN_WT_TITA_TT_MOC_ENDPOINT_PROJECTED_SCATTER = True
+    RUN_WT_TITA_TT_MOC_ENDPOINT_PROJECTED_SCATTER = False
 
     if RUN_WT_TITA_TT_MOC_ENDPOINT_PROJECTED_SCATTER:
         scatter_dir = use_output_folder(figures_dir, "WT_TiTa_TT_MOC_endpoint_projected_scatter")
