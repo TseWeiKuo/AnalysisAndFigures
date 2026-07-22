@@ -605,9 +605,7 @@ class PlotCreator:
             sc_csv_paths,
             tt_joints=("L-fTT", "L-mTT", "L-hTT"),
             plane_axis=("R-mBC", "L-mBC"),
-            reference_axis=("R-mBC", "R-hBC"),
             origin_keypoint="R-mBC",
-            origin_frame="moc",
             trial_types=("Landing", "Flying"),
             tau=0.71,
             axis_average_frames=100,
@@ -630,8 +628,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             save_csv=True
     ):
         return pg.plot_TT_MOC_to_SLC_endpoint_projected_combined(**locals())
@@ -706,8 +704,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=True,
             smooth_window_frames=5,
             smooth_polyorder=2,
@@ -729,8 +727,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=False,
             smooth_window_frames=5,
             smooth_polyorder=2,
@@ -786,8 +784,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=False,
             smooth_window_frames=5,
             smooth_polyorder=2,
@@ -857,8 +855,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7
     ):
         return pg.plot_left_TT_path_efficiency_grouped_stripplots(**locals())
     def _detect_chrimson_wing_mol(
@@ -870,8 +868,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=True,
             smooth_window_frames=5,
             smooth_polyorder=2
@@ -885,13 +883,35 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=True,
             smooth_window_frames=5,
             smooth_polyorder=2
     ):
         return po.plot_chrimson_LP(**locals())
+    def plot_chrimson_LP_metadata(
+            self,
+            group_info,
+            color="red",
+            tau=0.71,
+            light_on_frame=750,
+            min_trial_num=8
+    ):
+        return po.plot_chrimson_LP_metadata(**locals())
+    def get_chrimson_metadata_on_ll_data(
+            self,
+            group_info,
+            tau=0.71,
+            light_on_frame=750,
+            min_trial_num=8
+    ):
+        return po.get_chrimson_metadata_on_ll_data(
+            group_info=group_info,
+            tau=tau,
+            light_on_frame=light_on_frame,
+            min_trial_num=min_trial_num
+        )
     def plot_chrimson_LP_change_summary(
             self,
             groups,
@@ -904,8 +924,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=True,
             smooth_window_frames=5,
             smooth_polyorder=2
@@ -934,7 +954,7 @@ class PlotCreator:
     def plot_TT_summary_metrics_vs_LL(
             self,
             group_info,
-            legs=("L-f", "L-m", "L-h"),
+            leg="L-h",
             trial_types=("Landing", "Flying"),
             tau=0.71,
             trajectory_window_mode="mol_adjusted",
@@ -949,7 +969,8 @@ class PlotCreator:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7
     ):
         return pg.plot_TT_summary_metrics_vs_LL(**locals())
+

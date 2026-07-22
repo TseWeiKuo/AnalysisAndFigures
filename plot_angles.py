@@ -25,8 +25,8 @@ def plot_selected_chrimson_angle_traces(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2,
@@ -217,8 +217,8 @@ def plot_wt_contact_group_angle_traces(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=False,
         smooth_window_frames=5,
         smooth_polyorder=2,
@@ -347,6 +347,8 @@ def plot_wt_contact_group_angle_traces(
                 smooth_angle=smooth_angle,
                 smooth_window_frames=smooth_window_frames,
                 smooth_polyorder=smooth_polyorder,
+                qc_start=start_frame,
+                qc_end=end_frame,
                 return_qc=apply_tracking_qc
             )
             if apply_tracking_qc:
@@ -363,6 +365,19 @@ def plot_wt_contact_group_angle_traces(
                         "Joint_Type": joint_type,
                     })
                     qc_rows.append(qc_record)
+                    if not bool(qc_record.get("QC_Passed", True)):
+                        skipped_rows.append({
+                            "Column": column_label,
+                            "Contact_Group": contact_group,
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Joint_Type": joint_type,
+                            "Reason": "failed angle tracking QC",
+                            **qc_record,
+                        })
+                        continue
             else:
                 angle_data = angle_result
             angle_trace = angle_data[joint_name]
@@ -773,3 +788,4 @@ def plot_angle_traces_by_trial_sets(
         summary_df.to_csv(f"{file_name}_summary.csv", index=False)
 
     return fig, axes, summary_df
+

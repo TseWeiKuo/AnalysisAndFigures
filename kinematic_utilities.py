@@ -4,6 +4,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import tracking_qc as tqc
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
@@ -153,14 +154,17 @@ class SimpleCalculation:
             keypoints,
             min_cameras=2,
             error_thresholds=None,
-            require_finite_error=True
+            require_finite_error=True,
+            error_max=50,
+            score_min=0.8,
+            require_score=False,
     ):
         """
         Return one frame-wise QC mask requiring every listed keypoint to pass.
 
         A point/frame is valid when xyz are finite, camera count is at least
-        min_cameras, and error is finite/below the keypoint threshold when a
-        threshold is provided.
+        min_cameras, reprojection error is finite and below threshold, and
+        optional score fields pass score_min.
         """
         if isinstance(keypoints, str):
             keypoints = [keypoints]
@@ -181,28 +185,30 @@ class SimpleCalculation:
                 continue
 
             point = trial_info.trial_data[keypoint]
-            x = np.asarray(point.x_coord, dtype=float)
-            y = np.asarray(point.y_coord, dtype=float)
-            z = np.asarray(point.z_coord, dtype=float)
-            camera_count = np.asarray(point.camera_count, dtype=float)
-            error = np.asarray(point.error, dtype=float)
-
-            mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
-            mask &= np.isfinite(camera_count) & (camera_count >= min_cameras)
-
-            threshold = None if error_thresholds is None else error_thresholds.get(keypoint)
-            if threshold is not None and not pd.isna(threshold):
-                mask &= np.isfinite(error) & (error <= float(threshold))
-            elif require_finite_error:
-                mask &= np.isfinite(error)
-
+            _, components, metadata = tqc.point_invalid_components(
+                point=point,
+                keypoint=keypoint,
+                min_cameras=min_cameras,
+                error_thresholds=error_thresholds,
+                error_max=error_max,
+                score_min=score_min,
+                require_score=require_score,
+            )
+            if not require_finite_error:
+                invalid = components["invalid"] & ~components["error_missing"]
+            else:
+                invalid = components["invalid"]
+            mask = ~invalid
             combined_mask &= mask
             point_summaries.append({
                 "Keypoint": keypoint,
                 "Reason": "ok",
                 "Valid_Frame_Fraction": float(np.mean(mask)) if len(mask) else np.nan,
                 "Min_Cameras": min_cameras,
-                "Error_Threshold": threshold,
+                "Error_Threshold": metadata["Error_Threshold"],
+                "Score_Min": score_min,
+                "Score_Column": metadata["Score_Column"],
+                "Score_Column_Missing": metadata["Score_Column_Missing"],
             })
 
         return combined_mask, pd.DataFrame(point_summaries)
@@ -290,8 +296,13 @@ class SimpleCalculation:
             angle_points,
             min_cameras=2,
             error_thresholds=None,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
+            error_max=50,
+            score_min=0.8,
+            require_score=False,
+            start_frame=None,
+            end_frame=None,
             smooth=False,
             smooth_window_frames=5,
             smooth_polyorder=2
@@ -309,13 +320,15 @@ class SimpleCalculation:
             angle_points,
             min_cameras=min_cameras,
             error_thresholds=error_thresholds,
-            require_finite_error=True
+            require_finite_error=True,
+            error_max=error_max,
+            score_min=score_min,
+            require_score=require_score,
         )
-        qc_mask &= np.isfinite(angle_trace)
-        filtered = angle_trace.copy()
-        filtered[~qc_mask] = np.nan
-        interpolated, interpolated_count = self.interpolate_short_nan_gaps(
-            filtered,
+        invalid_mask = (~qc_mask) | ~np.isfinite(angle_trace)
+        interpolated, interpolated_count = tqc.interpolate_invalid_trace_gaps(
+            angle_trace,
+            invalid_mask,
             max_gap_frames=max_interp_gap_frames
         )
         if smooth:
@@ -325,19 +338,23 @@ class SimpleCalculation:
                 polyorder=smooth_polyorder
             )
 
-        gap_lengths = self.invalid_gap_lengths(qc_mask)
-        summary = {
-            "Valid_Frame_Fraction": float(np.mean(qc_mask)) if len(qc_mask) else np.nan,
-            "Max_Invalid_Gap_Frames": int(max(gap_lengths)) if gap_lengths else 0,
+        summary = tqc.summarize_invalid_mask(
+            invalid_mask,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            max_interp_gap_frames=max_interp_gap_frames,
+            min_valid_fraction=min_valid_fraction,
+        )
+        summary.update({
             "Interpolated_Frame_Count": int(interpolated_count),
-            "Long_Gap_Count": int(sum(gap > max_interp_gap_frames for gap in gap_lengths)),
             "Min_Cameras": min_cameras,
-            "Max_Interp_Gap_Frames": max_interp_gap_frames,
-            "Min_Valid_Fraction": min_valid_fraction,
+            "Error_Max": error_max,
+            "Score_Min": score_min,
+            "Require_Score": bool(require_score),
             "Smooth_Angle": bool(smooth),
             "Smooth_Window_Frames": smooth_window_frames,
-        }
-        return interpolated, qc_mask, summary, point_summary
+        })
+        return interpolated, ~invalid_mask, summary, point_summary
 
     def interpolate_short_xyz_gaps(self, xyz, max_gap_frames=4):
         xyz = np.asarray(xyz, dtype=float).copy()
@@ -356,8 +373,11 @@ class SimpleCalculation:
             keypoint,
             min_cameras=2,
             error_thresholds=None,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
+            error_max=50,
+            score_min=0.8,
+            require_score=False,
             start_frame=None,
             end_frame=None,
             require_start_end_valid=False
@@ -369,18 +389,21 @@ class SimpleCalculation:
         are linearly interpolated independently for x/y/z. Callers should skip
         windows with Max_Invalid_Gap_Frames > max_interp_gap_frames.
         """
-        xyz = np.asarray(self.ReadAndTranspose(keypoint, trial_info), dtype=float)
-        qc_mask, point_summary = self.get_tracking_qc_mask(
-            trial_info,
-            keypoint,
+        error_thresholds = self.load_tracking_error_thresholds(error_thresholds)
+        point = trial_info.trial_data[keypoint]
+        xyz, components, metadata = tqc.point_invalid_components(
+            point=point,
+            keypoint=keypoint,
             min_cameras=min_cameras,
             error_thresholds=error_thresholds,
-            require_finite_error=True
+            error_max=error_max,
+            score_min=score_min,
+            require_score=require_score,
         )
-        filtered = xyz.copy()
-        filtered[~qc_mask] = np.nan
-        filtered, interpolated_count = self.interpolate_short_xyz_gaps(
-            filtered,
+        invalid_mask = components["invalid"]
+        filtered, interpolated_count = tqc.interpolate_invalid_xyz_gaps(
+            xyz,
+            invalid_mask,
             max_gap_frames=max_interp_gap_frames
         )
 
@@ -389,42 +412,37 @@ class SimpleCalculation:
         if end_frame is None:
             end_frame = len(qc_mask) - 1
         start_frame = max(int(start_frame), 0)
-        end_frame = min(int(end_frame), len(qc_mask) - 1)
-        window_mask = qc_mask[start_frame:end_frame + 1] if end_frame >= start_frame else np.array([], dtype=bool)
-        gap_lengths = self.invalid_gap_lengths(window_mask)
-        start_valid = bool(qc_mask[start_frame]) if len(qc_mask) and 0 <= start_frame < len(qc_mask) else False
-        end_valid = bool(qc_mask[end_frame]) if len(qc_mask) and 0 <= end_frame < len(qc_mask) else False
-        valid_fraction = float(np.mean(window_mask)) if len(window_mask) else np.nan
-        max_gap = int(max(gap_lengths)) if gap_lengths else 0
-        long_gap_count = int(sum(gap > max_interp_gap_frames for gap in gap_lengths))
-
-        exclusion_reasons = []
-        if len(window_mask) == 0:
-            exclusion_reasons.append("empty_qc_window")
-        if pd.isna(valid_fraction) or valid_fraction < min_valid_fraction:
-            exclusion_reasons.append("valid_fraction_below_threshold")
-        if max_gap > max_interp_gap_frames:
-            exclusion_reasons.append("long_invalid_gap")
-        if require_start_end_valid and not start_valid:
-            exclusion_reasons.append("start_frame_invalid")
-        if require_start_end_valid and not end_valid:
-            exclusion_reasons.append("end_frame_invalid")
-
-        summary = {
+        end_frame = min(int(end_frame), len(invalid_mask) - 1)
+        summary = tqc.summarize_invalid_mask(
+            invalid_mask,
+            components=components,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            max_interp_gap_frames=max_interp_gap_frames,
+            min_valid_fraction=min_valid_fraction,
+            require_start_end_valid=require_start_end_valid,
+        )
+        summary.update({
             "Keypoint": keypoint,
-            "Valid_Frame_Fraction": valid_fraction,
-            "Max_Invalid_Gap_Frames": max_gap,
-            "Long_Gap_Count": long_gap_count,
             "Interpolated_Frame_Count": int(interpolated_count),
-            "Start_Frame_Valid": start_valid,
-            "End_Frame_Valid": end_valid,
             "Min_Cameras": min_cameras,
-            "Max_Interp_Gap_Frames": max_interp_gap_frames,
-            "Min_Valid_Fraction": min_valid_fraction,
-            "QC_Passed": len(exclusion_reasons) == 0,
-            "QC_Exclusion_Reason": ";".join(exclusion_reasons),
-        }
-        return filtered, qc_mask, summary, point_summary
+            "Error_Max": error_max,
+            "Score_Min": score_min,
+            "Require_Score": bool(require_score),
+            **metadata,
+        })
+        point_summary = pd.DataFrame([{
+            "Keypoint": keypoint,
+            "Reason": "ok",
+            "Valid_Frame_Fraction": summary["Valid_Frame_Fraction"],
+            "Invalid_Frame_Fraction": summary["Invalid_Frame_Fraction"],
+            "Min_Cameras": min_cameras,
+            "Error_Threshold": metadata["Error_Threshold"],
+            "Score_Min": score_min,
+            "Score_Column": metadata["Score_Column"],
+            "Score_Column_Missing": metadata["Score_Column_Missing"],
+        }])
+        return filtered, ~invalid_mask, summary, point_summary
 
     # ------------------------------------------------------------
     # Segment / angle calculations from Trial object
@@ -466,8 +484,11 @@ class SimpleCalculation:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
+            error_max=50,
+            score_min=0.8,
+            require_score=False,
             smooth_angle=False,
             smooth_window_frames=5,
             smooth_polyorder=2,
@@ -498,6 +519,11 @@ class SimpleCalculation:
                         error_thresholds=tracking_error_thresholds,
                         max_interp_gap_frames=max_interp_gap_frames,
                         min_valid_fraction=min_valid_fraction,
+                        error_max=error_max,
+                        score_min=score_min,
+                        require_score=require_score,
+                        start_frame=qc_start,
+                        end_frame=qc_end,
                         smooth=smooth_angle,
                         smooth_window_frames=smooth_window_frames,
                         smooth_polyorder=smooth_polyorder
@@ -535,6 +561,11 @@ class SimpleCalculation:
                         error_thresholds=tracking_error_thresholds,
                         max_interp_gap_frames=max_interp_gap_frames,
                         min_valid_fraction=min_valid_fraction,
+                        error_max=error_max,
+                        score_min=score_min,
+                        require_score=require_score,
+                        start_frame=qc_start,
+                        end_frame=qc_end,
                         smooth=smooth_angle,
                         smooth_window_frames=smooth_window_frames,
                         smooth_polyorder=smooth_polyorder
@@ -1339,8 +1370,8 @@ class GroupDataAnalyzer:
             apply_tracking_qc=False,
             tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=4,
-            min_valid_fraction=0.8,
+            max_interp_gap_frames=5,
+            min_valid_fraction=0.7,
             smooth_angle=False,
             smooth_window_frames=5,
             smooth_polyorder=2,
@@ -2354,3 +2385,4 @@ class GroupDataAnalyzer:
         print(param_df["Correction_Status"].value_counts())
 
         return param_df
+

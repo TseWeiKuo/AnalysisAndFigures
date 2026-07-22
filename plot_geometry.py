@@ -20,15 +20,21 @@ import trial_helpers as th
 
 def _load_sc_lookup(calculator, sc_csv_path, legs):
     """Load a secondary-contact CSV keyed by the standard trial index."""
+    # SLC-adjusted windows need a secondary-contact table because each leg can
+    # have its own valid secondary-contact frame.
     if sc_csv_path is None:
         raise ValueError("sc_csv_path is required when trajectory_window_mode='SLC_adjusted'.")
 
+    # The CSV must contain the trial Index column plus one column per leg,
+    # for example L-f, L-m, and L-h.
     sc_df = pd.read_csv(sc_csv_path)
     required_columns = {"Index", *legs}
     missing_columns = required_columns.difference(sc_df.columns)
     if missing_columns:
         raise ValueError(f"SC CSV is missing required columns: {sorted(missing_columns)}")
 
+    # Parse the human-readable Index cell into the same tuple form used by the
+    # Group/Trial data structures, then store the whole CSV row for lookup.
     lookup = {}
     for _, sc_row in sc_df.iterrows():
         index = calculator.parse_index_cell(sc_row["Index"])
@@ -51,19 +57,27 @@ def _select_tt_window_end(
         tau
 ):
     """Choose the fixed, MOL-adjusted, or SLC-adjusted TT endpoint."""
+    # Fixed mode always uses the same duration after MOC, clipped to the last
+    # available frame.
     if trajectory_window_mode == "fixed":
         base_end = int(min(moc + trajectory_window_s * fps, total_frames - 1))
         base_rule = f"MOC_to_MOC_plus_{trajectory_window_s}s"
+    # MOL-adjusted mode uses MOC->MOL for successful landings when MOL is valid.
     elif outcome == "Success" and not pd.isna(mol) and mol > moc:
         base_end = int(min(mol, total_frames - 1))
         base_rule = "MOC_to_MOL"
+    # Failed or missing-MOL trials fall back to the censored analysis window.
     else:
         base_end = int(min(moc + tau * fps, total_frames - 1))
         base_rule = "MOC_to_MOC_plus_tau"
 
+    # In fixed or MOL-adjusted modes the base endpoint is final; no SC CSV is
+    # consulted.
     if trajectory_window_mode != "SLC_adjusted":
         return base_end, base_rule, np.nan, False
 
+    # SLC-adjusted mode first defines the furthest valid search window for a
+    # possible SLC frame. If no SLC is found, this endpoint is used instead.
     if outcome == "Success" and not pd.isna(mol) and mol > moc:
         valid_end = int(min(mol, total_frames - 1))
         no_sc_rule = "MOC_to_MOL_no_valid_SLC"
@@ -74,10 +88,13 @@ def _select_tt_window_end(
         valid_end = int(min(moc + tau * fps, total_frames - 1))
         no_sc_rule = "MOC_to_MOC_plus_tau_no_valid_SLC"
 
+    # Pull the trial's secondary-contact row. Missing rows or missing leg
+    # columns fall back to the no-SLC endpoint.
     sc_row = sc_lookup.get(tuple(index))
     if sc_row is None or leg not in sc_row:
         return valid_end, no_sc_rule, np.nan, False
 
+    # Accept the SLC frame only if it lies inside the MOC-to-valid_end window.
     is_valid, sc_frame = calculator.validate_sc_frame_window(
         sc_row[leg],
         moc,
@@ -90,17 +107,25 @@ def _select_tt_window_end(
 
 def _calculate_tt_metrics(tt_xyz, fps, min_frames=3, min_path_length=1e-6):
     """Calculate speed, efficiency, length, displacement, and duration."""
+    # Drop frames with any non-finite x/y/z coordinate before measuring motion.
     tt_xyz = np.asarray(tt_xyz, dtype=float)
     valid = np.all(np.isfinite(tt_xyz), axis=1)
     tt_xyz = tt_xyz[valid]
+    # Require enough samples to define at least a short trajectory.
     if len(tt_xyz) < min_frames:
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
+    # Path length is the sum of frame-to-frame 3D step distances.
     steps = np.diff(tt_xyz, axis=0)
     path_length = np.sum(np.linalg.norm(steps, axis=1))
+    # Displacement is the straight-line distance between the first and last
+    # valid TT positions in the selected window.
     displacement = np.linalg.norm(tt_xyz[-1] - tt_xyz[0])
+    # Duration uses the number of frame intervals, not the number of samples.
     duration_s = (len(tt_xyz) - 1) / fps
     average_speed = path_length / duration_s if duration_s > 0 else np.nan
+    # Path efficiency approaches 1 for a straight path and decreases as the
+    # trajectory becomes more circuitous.
     path_efficiency = (
         displacement / path_length
         if path_length > min_path_length
@@ -112,8 +137,12 @@ def _calculate_tt_metrics(tt_xyz, fps, min_frames=3, min_path_length=1e-6):
 def _empty_qc_summary():
     return {
         "Valid_Frame_Fraction": np.nan,
+        "Invalid_Frame_Fraction": np.nan,
+        "Invalid_Frame_Count": np.nan,
         "Max_Invalid_Gap_Frames": np.nan,
         "Interpolated_Frame_Count": np.nan,
+        "Interpolatable_Invalid_Fraction": np.nan,
+        "Max_Invalid_Fraction": np.nan,
         "QC_Passed": True,
         "QC_Exclusion_Reason": "",
     }
@@ -125,9 +154,7 @@ def _collect_TT_MOC_to_SLC_projected_data(
         sc_csv_paths,
         tt_joints,
         plane_axis,
-        reference_axis,
         origin_keypoint,
-        origin_frame,
         trial_types,
         tau,
         axis_average_frames,
@@ -139,15 +166,17 @@ def _collect_TT_MOC_to_SLC_projected_data(
         min_valid_fraction,
 ):
     """Collect projected TT trajectory/endpoint data for combined TT plots."""
+    # Validate mode arguments early so downstream geometric assumptions are
+    # explicit before reading any trial data.
     if axis_average_anchor not in {"moc", "mol", "moc_to_endpoint"}:
         raise ValueError("axis_average_anchor must be 'moc', 'mol', or 'moc_to_endpoint'.")
-    if origin_frame not in {"moc", "endpoint", "axis_average"}:
-        raise ValueError("origin_frame must be 'moc', 'endpoint', or 'axis_average'.")
     if axis_average_frames < 1:
         raise ValueError("axis_average_frames must be >= 1.")
-    if len(plane_axis) != 2 or len(reference_axis) != 2:
-        raise ValueError("plane_axis and reference_axis must each contain two keypoint names.")
+    if len(plane_axis) != 2:
+        raise ValueError("plane_axis must contain two keypoint names.")
 
+    # Normalize group_info into a list of (plot label, Group object) pairs. This
+    # allows callers to pass one Group, a list of Groups, or a label->Group dict.
     if isinstance(group_info, dict):
         group_items = list(group_info.items())
     elif isinstance(group_info, (list, tuple)):
@@ -155,17 +184,23 @@ def _collect_TT_MOC_to_SLC_projected_data(
     else:
         group_items = [(group_info.group_name, group_info)]
 
+    # A single SC CSV path is only unambiguous for a single group. Multi-group
+    # plots need a dict so each group can use its own secondary-contact file.
     if not isinstance(sc_csv_paths, dict):
         if len(group_items) != 1:
             raise ValueError("sc_csv_paths must be a dict when plotting multiple groups.")
         sc_csv_paths = {group_items[0][0]: sc_csv_paths}
 
+    # Every trial must contain TT joints, the plane-defining axis, the origin
+    # keypoint, and platform-tip motion data for projection into 2D.
     required_points = set(tt_joints) | set(plane_axis) | {origin_keypoint, "platform-tip"}
     rows = []
     trajectory_rows = []
     skipped_rows = []
 
     def unit(vector, name):
+        # Convert any vector into a unit vector and reject degenerate axes,
+        # because projection would be unstable with near-zero directions.
         vector = np.asarray(vector, dtype=float)
         norm = np.linalg.norm(vector)
         if not np.isfinite(norm) or norm < 1e-8:
@@ -173,6 +208,9 @@ def _collect_TT_MOC_to_SLC_projected_data(
         return vector / norm
 
     def average_slice(total_frames, moc, endpoint):
+        # Select the frame range used to estimate the anatomical projection
+        # plane. This can be anchored before MOC, near MOL/endpoint, or across
+        # the full MOC-to-endpoint interval.
         if axis_average_anchor == "moc":
             start = max(moc - axis_average_frames, 0)
             stop = moc
@@ -185,6 +223,8 @@ def _collect_TT_MOC_to_SLC_projected_data(
         return None if stop <= start else slice(start, stop)
 
     def read_axis(point_a, point_b, trial_info, avg_slice):
+        # Read two 3D keypoint traces, average each across avg_slice, and return
+        # the mean location of point_a plus the point_a->point_b direction.
         coords_a = self.calculator.ReadAndTranspose(point_a, trial_info).astype(float)
         coords_b = self.calculator.ReadAndTranspose(point_b, trial_info).astype(float)
         mean_a = np.nanmean(coords_a[avg_slice], axis=0)
@@ -192,6 +232,8 @@ def _collect_TT_MOC_to_SLC_projected_data(
         return mean_a, mean_b - mean_a
 
     def platform_motion_axis(trial_info, start_frame=200, stop_frame=250):
+        # Use platform-tip motion as the projected Y reference direction. The
+        # best-fit motion axis is estimated by PCA/SVD over a fixed frame window.
         platform_xyz = self.calculator.ReadAndTranspose("platform-tip", trial_info).astype(float)
         start = max(int(start_frame), 0)
         stop = min(int(stop_frame) + 1, len(platform_xyz))
@@ -203,18 +245,24 @@ def _collect_TT_MOC_to_SLC_projected_data(
         if len(coords) < 2:
             raise ValueError("platform-tip motion window has fewer than 2 finite coordinates.")
 
+        # Center the coordinates before SVD so the first right-singular vector
+        # describes direction of movement, not absolute position.
         centered = coords - np.nanmean(coords, axis=0)
         _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
         if singular_values[0] < 1e-8:
             raise ValueError("platform-tip motion window has near-zero movement.")
         motion = vh[0]
 
+        # Orient the axis in the same direction as net platform movement so sign
+        # is consistent across trials.
         net_motion = coords[-1] - coords[0]
         if np.dot(motion, net_motion) < 0:
             motion = -motion
         return motion, start, stop - 1
 
     def project_point(point, origin_3d, plane_normal, basis_x, basis_y):
+        # Orthogonally project a 3D point onto the selected plane, then express
+        # that projected point in the 2D basis defined by basis_x and basis_y.
         point = np.asarray(point, dtype=float)
         if not np.all(np.isfinite(point)):
             return np.nan, np.nan
@@ -223,9 +271,13 @@ def _collect_TT_MOC_to_SLC_projected_data(
         return float(np.dot(relative, basis_x)), float(np.dot(relative, basis_y))
 
     def lookup_sc_path(group_label, group):
+        # Prefer the plotting label key, but fall back to the Group object's
+        # internal name when looking up the SC CSV path.
         return sc_csv_paths.get(group_label, sc_csv_paths.get(group.group_name))
 
     for group_label, current_group in group_items:
+        # Load this group's secondary-contact table and validate that it has
+        # one column per TT leg being analyzed.
         sc_path = lookup_sc_path(group_label, current_group)
         if sc_path is None:
             raise ValueError(f"No SC CSV path provided for group '{group_label}'.")
@@ -240,18 +292,24 @@ def _collect_TT_MOC_to_SLC_projected_data(
             for _, sc_row in sc_df.iterrows()
         }
 
+        # Initialize metadata and kinematic traces on demand. This keeps the
+        # plotting function usable from notebooks without requiring setup code.
         if len(current_group.trial_metadata) == 0:
             current_group.initialize_manual_data()
             current_group.filter_nan_fly()
         current_group.read_kinematic_data(list(trial_types))
 
         for index in current_group.get_targeted_trials(list(trial_types)):
+            # Convert the fly/trial index into the key used by both metadata
+            # and loaded kinematic data.
             index_tuple = tuple(index)
             key = current_group._trial_key(index[0], index[1])
             if key not in current_group.fly_kinematic_data or key not in current_group.trial_metadata:
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": "missing kinematic data or metadata"})
                 continue
 
+            # Pull trial objects and reject trials missing any points needed for
+            # either projection geometry or TT trajectory extraction.
             trial_info = current_group.fly_kinematic_data[key]
             meta = current_group.trial_metadata[key]
             missing_points = [point for point in required_points if point not in trial_info.trial_data]
@@ -259,6 +317,8 @@ def _collect_TT_MOC_to_SLC_projected_data(
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": f"missing required points: {missing_points}"})
                 continue
 
+            # MOC anchors the trajectory start. FPS converts frame differences
+            # into seconds for trajectory averaging and output tables.
             moc = trial_info.moc
             mol = trial_info.mol
             fps = trial_info.fps
@@ -270,6 +330,8 @@ def _collect_TT_MOC_to_SLC_projected_data(
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": f"invalid MOC: {moc}"})
                 continue
 
+            # Define the maximum endpoint that can be considered for this trial:
+            # successful trials use MOL; failed/censored trials use MOC + tau.
             outcome = th.classify_landing(meta, current_group.latency_threshold)
             if outcome == "Success":
                 if pd.isna(mol) or mol <= moc:
@@ -285,43 +347,55 @@ def _collect_TT_MOC_to_SLC_projected_data(
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": "endpoint window is empty"})
                 continue
 
+            # Choose the frames used to estimate the projection plane and axes.
             avg_slice = average_slice(trial_info.total_frames_number, moc, valid_end)
             if avg_slice is None:
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": "empty axis averaging window"})
                 continue
 
             try:
+                # plane_axis defines the plane normal; platform-tip motion is
+                # projected into that plane to define the vertical plotting axis.
                 plane_origin, plane_vector = read_axis(plane_axis[0], plane_axis[1], trial_info, avg_slice)
                 plane_normal = unit(plane_vector, "plane_axis")
                 platform_motion, motion_start, motion_stop = platform_motion_axis(trial_info)
                 platform_motion_on_plane = platform_motion - np.dot(platform_motion, plane_normal) * plane_normal
                 basis_y = unit(platform_motion_on_plane, "platform-tip motion projected onto plane")
+                # The x-axis is perpendicular to basis_y within the projection
+                # plane, giving a right-handed 2D coordinate system.
                 basis_x = unit(np.cross(basis_y, plane_normal), "platform-motion-derived projected x-axis")
             except ValueError as exc:
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": str(exc)})
                 continue
 
+            # Set the coordinate origin from the selected origin keypoint at
+            # MOC. All projected TT coordinates are reported relative to this
+            # MOC-anchored origin.
             origin_xyz = self.calculator.ReadAndTranspose(origin_keypoint, trial_info).astype(float)
-            if origin_frame == "moc":
-                origin_3d = origin_xyz[moc]
-            elif origin_frame == "endpoint":
-                origin_3d = origin_xyz[valid_end]
-            else:
-                origin_3d = np.nanmean(origin_xyz[avg_slice], axis=0)
+            origin_3d = origin_xyz[moc]
             origin_x, origin_y = project_point(origin_3d, plane_origin, plane_normal, basis_x, basis_y)
             if not np.isfinite(origin_x) or not np.isfinite(origin_y):
                 skipped_rows.append({"Group_Label": group_label, "Index": str(index), "Reason": "invalid projected origin"})
                 continue
 
+            # For each TT joint, choose a leg-specific endpoint, collect the full
+            # projected trajectory, and store endpoint/AEP/VEP landmark points.
             sc_row = sc_lookup.get(index_tuple)
             for joint in tt_joints:
+                # Convert a keypoint name such as L-mTT into the SC CSV leg
+                # column such as L-m.
                 leg = joint.replace("TT", "")
+                # Start from the trial-level fallback endpoint. This will be
+                # replaced by SLC if the SC table provides a valid leg-specific
+                # frame inside the trial window.
                 endpoint_frame = valid_end
                 endpoint_rule = fallback_rule
                 slc_frame = np.nan
                 slc_valid = False
 
                 if sc_row is not None:
+                    # Validate the candidate SLC frame against MOC and the
+                    # trial's maximum valid endpoint.
                     slc_valid, candidate_slc_frame = self.calculator.validate_sc_frame_window(
                         sc_row[leg],
                         moc,
@@ -333,6 +407,8 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         slc_frame = int(candidate_slc_frame)
 
                 if apply_tracking_qc:
+                    # QC mode returns an interpolated/filtered xyz trace plus
+                    # metadata about invalid frames in the selected window.
                     xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
                         trial_info=trial_info,
                         keypoint=joint,
@@ -354,17 +430,27 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         })
                         continue
                 else:
+                    # Without QC, use the raw 3D TT trace and fill QC columns
+                    # with neutral/NaN values for consistent output schema.
                     xyz = self.calculator.ReadAndTranspose(joint, trial_info).astype(float)
                     qc_summary = _empty_qc_summary()
 
+                # Project every finite TT coordinate from MOC through endpoint
+                # into the 2D plane and store the trial-level trajectory rows.
                 projected_trace = []
                 for frame in range(moc, endpoint_frame + 1):
+                    # Convert this frame's 3D TT position into plane coordinates.
                     x, y = project_point(xyz[frame], plane_origin, plane_normal, basis_x, basis_y)
                     if not np.isfinite(x) or not np.isfinite(y):
                         continue
+                    # Re-zero the projected coordinate system so the selected
+                    # origin keypoint is at (0, 0).
                     projected_x = x - origin_x
                     projected_y = y - origin_y
+                    # Keep an in-memory copy for finding AEP/VEP after the loop.
                     projected_trace.append((frame, projected_x, projected_y))
+                    # Append one row per frame; these rows are later averaged
+                    # by fly and also plotted as raw trial traces.
                     trajectory_rows.append({
                         "Group_Label": group_label,
                         "Group_Name": current_group.group_name,
@@ -391,11 +477,18 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
                         "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                         "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                        "Invalid_Frame_Fraction": qc_summary.get("Invalid_Frame_Fraction", np.nan),
+                        "Invalid_Frame_Count": qc_summary.get("Invalid_Frame_Count", np.nan),
+                        "Max_Invalid_Fraction": qc_summary.get("Max_Invalid_Fraction", np.nan),
                         "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
                         "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
+                        "Interpolatable_Invalid_Fraction": qc_summary.get("Interpolatable_Invalid_Fraction", np.nan),
                     })
 
                 def append_point_row(point_type, frame, x, y, marker):
+                    # Store special landmark points in a separate table from the
+                    # full trajectory. These points drive radial displacement
+                    # summaries and endpoint overlays.
                     rows.append({
                         "Group_Label": group_label,
                         "Group_Name": current_group.group_name,
@@ -412,7 +505,7 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         "Projected_X": x,
                         "Projected_Y": y,
                         "Origin_Keypoint": origin_keypoint,
-                        "Origin_Frame_Mode": origin_frame,
+                        "Origin_Frame_Mode": "moc",
                         "Endpoint_Frame": int(endpoint_frame),
                         "Endpoint_Rule": endpoint_rule,
                         "SLC_Frame": slc_frame,
@@ -430,10 +523,16 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
                         "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                         "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                        "Invalid_Frame_Fraction": qc_summary.get("Invalid_Frame_Fraction", np.nan),
+                        "Invalid_Frame_Count": qc_summary.get("Invalid_Frame_Count", np.nan),
+                        "Max_Invalid_Fraction": qc_summary.get("Max_Invalid_Fraction", np.nan),
                         "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
                         "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
+                        "Interpolatable_Invalid_Fraction": qc_summary.get("Interpolatable_Invalid_Fraction", np.nan),
                     })
 
+                # Save the start and selected endpoint positions for radial
+                # displacement calculations.
                 for point_type, frame, marker in (("MOC", moc, "o"), ("Endpoint", endpoint_frame, "D")):
                     x, y = project_point(xyz[frame], plane_origin, plane_normal, basis_x, basis_y)
                     if not np.isfinite(x) or not np.isfinite(y):
@@ -441,11 +540,17 @@ def _collect_TT_MOC_to_SLC_projected_data(
                     append_point_row(point_type, frame, x - origin_x, y - origin_y, marker)
 
                 if projected_trace:
+                    # AEP is the most anterior point in this projected coordinate
+                    # system: minimum projected X across the trajectory window.
                     aep_frame, aep_x, aep_y = min(projected_trace, key=lambda value: value[1])
+                    # VEP is the most ventral point: minimum projected Y across
+                    # the same trajectory window.
                     vep_frame, vep_x, vep_y = min(projected_trace, key=lambda value: value[2])
                     append_point_row("AEP", aep_frame, aep_x, aep_y, "<")
                     append_point_row("VEP", vep_frame, vep_x, vep_y, "v")
 
+    # Convert collected lists to DataFrames for plotting, CSV export, and
+    # downstream notebook inspection.
     point_df = pd.DataFrame(rows)
     trajectory_df = pd.DataFrame(trajectory_rows)
     skipped_df = pd.DataFrame(skipped_rows)
@@ -460,9 +565,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         sc_csv_paths,
         tt_joints=("L-fTT", "L-mTT", "L-hTT"),
         plane_axis=("R-mBC", "L-mBC"),
-        reference_axis=("R-mBC", "R-hBC"),
         origin_keypoint="R-mBC",
-        origin_frame="moc",
         trial_types=("Landing", "Flying"),
         tau=0.71,
         axis_average_frames=100,
@@ -485,8 +588,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         save_csv=True
 ):
     """
@@ -498,6 +601,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
     colored by TT joint and are resampled to target_fps before averaging
     each fly's trajectories.
     """
+    # Validate plotting and resampling options before doing the expensive data
+    # collection pass.
     if target_fps <= 0:
         raise ValueError("target_fps must be > 0.")
     if trajectory_average_mode not in {"absolute_time", "time_normalized"}:
@@ -511,11 +616,15 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
     if n_perm < 1:
         raise ValueError("n_perm must be >= 1.")
 
+    # Normalize TT joint input so later code can iterate over a tuple no matter
+    # whether the caller passed one string or several joints.
     if isinstance(tt_joints, str):
         tt_joints = (tt_joints,)
     else:
         tt_joints = tuple(tt_joints)
 
+    # Resolve one plotting color per TT joint. Dict input can be keyed either by
+    # full keypoint name (L-mTT) or leg name (L-m).
     if colors is None:
         colors = {
             "L-fTT": "#1f77b4",
@@ -526,6 +635,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                     if isinstance(colors, dict) else colors[i % len(colors)]
                     for i, joint in enumerate(tt_joints)}
 
+    # Normalize groups into explicit labels for row titles and group comparisons.
     if isinstance(group_info, dict):
         group_items = list(group_info.items())
     elif isinstance(group_info, (list, tuple)):
@@ -533,15 +643,16 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
     else:
         group_items = [(group_info.group_name, group_info)]
 
+    # Build the core trial-level trajectory table and landmark-point table.
+    # point_df stores MOC/endpoint/AEP/VEP points; trajectory_df stores one row
+    # per projected TT frame.
     point_df, trajectory_df, skipped_df = _collect_TT_MOC_to_SLC_projected_data(
         self=self,
         group_info=group_info,
         sc_csv_paths=sc_csv_paths,
         tt_joints=tt_joints,
         plane_axis=plane_axis,
-        reference_axis=reference_axis,
         origin_keypoint=origin_keypoint,
-        origin_frame=origin_frame,
         trial_types=trial_types,
         tau=tau,
         axis_average_frames=axis_average_frames,
@@ -553,6 +664,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         min_valid_fraction=min_valid_fraction,
     )
 
+    # Convert MOC and endpoint point rows into displacement vectors. Each vector
+    # represents one trial/joint movement from MOC to the selected endpoint.
     radial_rows = []
     radial_group_cols = ["Group_Label", "Index", "Fly#", "Trial#", "Joint", "Leg"]
     for group_keys, sub in point_df.groupby(radial_group_cols):
@@ -586,16 +699,23 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
     radial_df = pd.DataFrame(radial_rows)
 
     def fly_average_trajectories():
+        # Average trajectories within each fly, joint, and group. Averaging at
+        # the fly level avoids letting flies with more trials dominate the
+        # colored summary traces.
         average_rows = []
         if trajectory_df.empty:
             return pd.DataFrame()
 
+        # group_cols identifies one fly-level average trace; trial_cols splits
+        # that fly's raw trajectories into separate trials before resampling.
         group_cols = ["Group_Label", "Joint", "Leg", "Fly#"]
         trial_cols = ["Group_Label", "Joint", "Leg", "Fly#", "Trial#"]
         for fly_keys, fly_df in trajectory_df.groupby(group_cols):
             prepared = []
             max_time = 0
             for _, trial_df in fly_df.groupby(trial_cols):
+                # Sort by time and extract numeric x/y coordinates for one
+                # trial's projected TT trajectory.
                 trial_df = trial_df.sort_values("Time_From_MOC_s")
                 time_s = trial_df["Time_From_MOC_s"].to_numpy(dtype=float)
                 x_values = trial_df["Projected_X"].to_numpy(dtype=float)
@@ -603,9 +723,13 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 valid = np.isfinite(time_s) & np.isfinite(x_values) & np.isfinite(y_values)
                 if np.sum(valid) < 2:
                     continue
+                # Keep only finite samples; interpolation needs paired finite
+                # time, x, and y values.
                 time_s = time_s[valid]
                 x_values = x_values[valid]
                 y_values = y_values[valid]
+                # Drop duplicate time stamps because np.interp expects a
+                # monotonic set of x-coordinates.
                 unique_time, unique_idx = np.unique(time_s, return_index=True)
                 if len(unique_time) < 2:
                     continue
@@ -616,6 +740,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 continue
 
             if trajectory_average_mode == "time_normalized":
+                # Time-normalized averaging stretches each trial from 0 to 1,
+                # so all trials contribute across the full MOC-to-endpoint path.
                 average_time = np.linspace(0, 1, normalized_average_points)
                 x_stack = []
                 y_stack = []
@@ -624,11 +750,14 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                     x_stack.append(np.interp(average_time, normalized_time, x_values))
                     y_stack.append(np.interp(average_time, normalized_time, y_values))
 
+                # Average the aligned x/y coordinates across this fly's trials.
                 mean_x = np.nanmean(np.asarray(x_stack, dtype=float), axis=0)
                 mean_y = np.nanmean(np.asarray(y_stack, dtype=float), axis=0)
                 n_contributing = np.full(len(average_time), len(prepared), dtype=int)
                 time_unit = "normalized_MOC_to_endpoint"
             else:
+                # Absolute-time averaging resamples trajectories to target_fps
+                # and lets shorter trials become NaN after their endpoint.
                 average_time = np.arange(0, max_time + (0.5 / target_fps), 1 / target_fps)
                 x_stack = []
                 y_stack = []
@@ -641,11 +770,15 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                     x_stack.append(x_interp)
                     y_stack.append(y_interp)
 
+                # Mean is calculated over the trials still contributing at each
+                # absolute time point.
                 mean_x = np.nanmean(np.asarray(x_stack, dtype=float), axis=0)
                 mean_y = np.nanmean(np.asarray(y_stack, dtype=float), axis=0)
                 n_contributing = np.sum(np.isfinite(np.asarray(x_stack, dtype=float)), axis=0)
                 time_unit = "seconds_from_MOC"
 
+            # Store the fly-average trajectory in long-form rows for plotting
+            # and optional CSV export.
             for time_value, x_value, y_value, n_value in zip(average_time, mean_x, mean_y, n_contributing):
                 if not np.isfinite(x_value) or not np.isfinite(y_value):
                     continue
@@ -664,6 +797,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 })
         return pd.DataFrame(average_rows)
 
+    # Build fly-average TT trajectories and fly-average displacement vectors.
     fly_trajectory_df = fly_average_trajectories()
     fly_radial_df = pd.DataFrame()
     if not radial_df.empty:
@@ -681,11 +815,15 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             fly_radial_df["Mean_Displacement_Y"]
         )
 
+    # Compare fly-average radial vectors between groups. The primary test is a
+    # label-shuffle test on the distance between group mean vectors.
     radial_stats_df = pd.DataFrame()
     if not fly_radial_df.empty:
         rng = np.random.default_rng(random_state)
 
         def vector_permutation_test(vectors_a, vectors_b):
+            # Remove invalid vector rows before computing observed and permuted
+            # group differences.
             vectors_a = np.asarray(vectors_a, dtype=float)
             vectors_b = np.asarray(vectors_b, dtype=float)
             valid_a = np.all(np.isfinite(vectors_a), axis=1)
@@ -695,6 +833,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             if len(vectors_a) == 0 or len(vectors_b) == 0:
                 return (np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan)
 
+            # Observed statistic: Euclidean distance between the two group mean
+            # displacement vectors.
             mean_a = np.mean(vectors_a, axis=0)
             mean_b = np.mean(vectors_b, axis=0)
             observed_dx = float(mean_b[0] - mean_a[0])
@@ -705,6 +845,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             n_a = len(vectors_a)
             perm_stats = np.empty(n_perm, dtype=float)
             for perm_i in range(n_perm):
+                # Shuffle group labels while preserving original group sizes.
                 permuted = pooled[rng.permutation(len(pooled))]
                 perm_mean_a = np.mean(permuted[:n_a], axis=0)
                 perm_mean_b = np.mean(permuted[n_a:], axis=0)
@@ -726,6 +867,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             )
 
         def unpaired_or_nan(data_a, data_b, column):
+            # Secondary scalar tests compare x, y, or vector magnitude alone.
             values_a = data_a[column].to_numpy(dtype=float)
             values_b = data_b[column].to_numpy(dtype=float)
             values_a = values_a[np.isfinite(values_a)]
@@ -742,6 +884,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         stat_rows = []
         group_labels = [label for label, _ in group_items]
         for joint in tt_joints:
+            # Run pairwise group comparisons separately for each TT joint.
             joint_fly_df = fly_radial_df[fly_radial_df["Joint"] == joint]
             for group_a, group_b in itertools.combinations(group_labels, 2):
                 data_a = joint_fly_df[joint_fly_df["Group_Label"] == group_a]
@@ -797,6 +940,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 })
         radial_stats_df = pd.DataFrame(stat_rows)
 
+    # One row per group, two columns: projected TT trajectories at left and
+    # MOC-to-endpoint displacement vectors at right.
     fig, axes = plt.subplots(
         len(group_items),
         2,
@@ -808,6 +953,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         traj_ax = axes[row_i, 0]
         radial_ax = axes[row_i, 1]
 
+        # Plot all raw trial trajectories in light gray to show the distribution
+        # of movement paths without overpowering fly-average traces.
         group_traj = trajectory_df[trajectory_df["Group_Label"] == group_label]
         for _, trial_df in group_traj.groupby(["Joint", "Fly#", "Trial#"]):
             trial_df = trial_df.sort_values("Frame")
@@ -820,6 +967,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 zorder=1
             )
 
+        # Overlay each fly's average trajectory, colored by TT joint.
         group_fly_traj = fly_trajectory_df[fly_trajectory_df["Group_Label"] == group_label]
         for (joint, fly_num), fly_df in group_fly_traj.groupby(["Joint", "Fly#"]):
             fly_df = fly_df.sort_values("Time_From_MOC_s")
@@ -832,6 +980,9 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 zorder=3
             )
 
+        # Plot raw trial MOC-to-endpoint vectors. Depending on mode, vectors are
+        # either shown at their actual projected coordinates or re-zeroed at
+        # (0, 0) to compare displacement only.
         group_radial = radial_df[radial_df["Group_Label"] == group_label]
         for _, row in group_radial.iterrows():
             if radial_coordinate_mode == "trajectory_coordinates":
@@ -862,6 +1013,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 zorder=1
             )
 
+        # Overlay fly-average vectors and mark their endpoints.
         group_fly_radial = fly_radial_df[fly_radial_df["Group_Label"] == group_label]
         for _, row in group_fly_radial.iterrows():
             color = joint_colors[row["Joint"]]
@@ -900,11 +1052,15 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
                 zorder=4
             )
 
+        # Add zero-reference axes and force equal scaling so distances are not
+        # visually distorted.
         for ax in (traj_ax, radial_ax):
             ax.axhline(0, color="0.86", linewidth=0.7, zorder=0)
             ax.axvline(0, color="0.86", linewidth=0.7, zorder=0)
             ax.set_aspect("equal", adjustable="box")
 
+        # Optional reference circle, useful when displacement should be compared
+        # to a known platform or body-scale diameter.
         if radial_circle_diameter is not None:
             radial_ax.add_patch(
                 plt.Circle(
@@ -921,6 +1077,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         if row_i == 0:
             traj_ax.set_title("Projected TT trajectory")
             radial_ax.set_title("MOC-to-endpoint displacement")
+        # Add per-joint sample sizes directly on the trajectory panel.
         count_lines = []
         for joint in tt_joints:
             joint_traj = group_traj[group_traj["Joint"] == joint]
@@ -937,6 +1094,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             fontsize=8
         )
 
+    # Label only the bottom row's x-axes and every row's y-axes.
     axes[-1, 0].set_xlabel(f"Projected X from {origin_keypoint}")
     radial_xlabel = "Projected X from {0}".format(origin_keypoint) if radial_coordinate_mode == "trajectory_coordinates" else "Displacement X"
     radial_ylabel = "Projected Y" if radial_coordinate_mode == "trajectory_coordinates" else "Displacement Y"
@@ -945,6 +1103,8 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         axes[row_i, 0].set_ylabel(f"{group_items[row_i][0]}\nProjected Y")
         axes[row_i, 1].set_ylabel(radial_ylabel)
 
+    # Compute shared x/y limits across trajectory and radial panels so rows and
+    # columns can be compared directly.
     axis_values = []
     for group_label, _ in group_items:
         group_traj = trajectory_df[trajectory_df["Group_Label"] == group_label]
@@ -982,6 +1142,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         if not np.isfinite(shared_min) or not np.isfinite(shared_max) or shared_min == shared_max:
             shared_min, shared_max = -0.5, 0.5
 
+    # Round limits to half-unit ticks and apply the same limits to every panel.
     axis_pad = max((shared_max - shared_min) * 0.06, 0.05)
     tick_step = 0.5
     shared_min = math.floor((shared_min - axis_pad) / tick_step) * tick_step
@@ -997,6 +1158,7 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         ax.set_xticks(shared_ticks)
         ax.set_yticks(shared_ticks)
 
+    # Legend encodes colored fly-average TT joints plus gray raw trial traces.
     handles = [
         plt.Line2D([0], [0], color=joint_colors[joint], linewidth=fly_linewidth, label=joint)
         for joint in tt_joints
@@ -1010,6 +1172,9 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
     sns.despine()
     fig.tight_layout()
 
+    # Export every table needed to reproduce the figure: projected landmark
+    # points, raw trajectories, radial vectors, fly averages, statistics, and
+    # skipped-trial diagnostics.
     if file_name is not None:
         fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
         if save_csv:
@@ -1045,8 +1210,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7
 ):
     """
     Plot left-leg TT path efficiency grouped by outcome and IT/OT behavior.
@@ -1061,14 +1226,18 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     - SLC_adjusted: MOC -> leg-specific valid SC when present; otherwise
       success uses MOC -> MOL and failed uses MOC -> MOC + tau
     """
+    # Validate the trajectory window rule before loading data. The same helper
+    # is used here and in the TT summary-metric plots.
     if trajectory_window_mode not in {"fixed", "mol_adjusted", "SLC_adjusted"}:
         raise ValueError("trajectory_window_mode must be 'fixed', 'mol_adjusted', or 'SLC_adjusted'.")
 
+    # Normalize leg input for consistent iteration.
     if isinstance(legs, str):
         legs = (legs,)
     else:
         legs = tuple(legs)
 
+    # Default colors distinguish landing outcome and behavior category.
     if colors is None:
         colors = {
             "Success": "tab:blue",
@@ -1082,22 +1251,29 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         "OT": "Outward touch",
     }
 
+    # Load metadata and kinematic traces only if the caller has not already done
+    # so in a notebook or upstream script.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
         group_info.filter_nan_fly()
 
     group_info.read_kinematic_data(list(trial_types))
 
+    # SLC-adjusted mode needs secondary-contact frames; other modes leave this
+    # lookup empty and _select_tt_window_end ignores it.
     sc_lookup = {}
     if trajectory_window_mode == "SLC_adjusted":
         sc_lookup = _load_sc_lookup(self.calculator, sc_csv_path, legs)
 
+    # Convert IT/OT behavior annotations into a trial-index lookup.
     behavior_trial_sets = th.trial_sets_from_behavior_sources(behavior_sources)
     behavior_by_index = {}
     for behavior_label, indexes in behavior_trial_sets.items():
         for index in indexes:
             behavior_by_index[tuple(index)] = behavior_label
 
+    # Collect one path-efficiency row per valid trial and leg. QC failures are
+    # tracked separately so they can be exported when tracking QC is enabled.
     records = []
     qc_skipped_rows = []
     for index in group_info.get_targeted_trials(list(trial_types)):
@@ -1113,6 +1289,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         if pd.isna(moc) or pd.isna(fps):
             continue
 
+        # Landing latency is still stored in the output table, even though this
+        # plot groups path efficiency by outcome and behavior.
         ll_s, ll_censored, ll_source = th.landing_latency_seconds(meta, tau)
         if pd.isna(ll_s):
             continue
@@ -1127,10 +1305,13 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         )
 
         for leg in legs:
+            # Build the TT keypoint name for this leg, such as L-mTT.
             tt_point = f"{leg}TT"
             if tt_point not in trial_info.trial_data:
                 continue
 
+            # Select the analysis window endpoint according to fixed,
+            # MOL-adjusted, or SLC-adjusted rules.
             end_frame, window_rule, slc_frame, slc_valid = _select_tt_window_end(
                 self.calculator,
                 sc_lookup,
@@ -1149,6 +1330,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                 continue
 
             if apply_tracking_qc:
+                # QC mode filters/interpolates the selected TT trajectory window
+                # and records detailed rejection reasons.
                 tt_xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
                     trial_info=trial_info,
                     keypoint=tt_point,
@@ -1176,8 +1359,13 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                     })
                     continue
             else:
+                # Raw mode reads the TT coordinates directly and fills QC fields
+                # with empty values for a stable output schema.
                 tt_xyz = self.calculator.ReadAndTranspose(tt_point, trial_info)
                 qc_summary = _empty_qc_summary()
+
+            # Slice the TT trajectory from MOC through the selected endpoint and
+            # calculate path length, straight-line displacement, and efficiency.
             tt_segment = tt_xyz[moc_i:min(end_frame + 1, len(tt_xyz))]
             _, path_efficiency, path_length, displacement, _ = _calculate_tt_metrics(
                 tt_segment,
@@ -1186,6 +1374,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                 min_path_length=min_path_length
             )
             if pd.isna(path_efficiency):
+                # When QC was enabled, preserve failed metric rows as QC
+                # diagnostics rather than silently dropping them.
                 if apply_tracking_qc:
                     qc_skipped_rows.append({
                         "Group_Name": group_info.group_name,
@@ -1202,6 +1392,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                     })
                 continue
 
+            # Store trial-level path efficiency and all fields needed to audit
+            # the selected time window.
             records.append({
                 "Group_Name": group_info.group_name,
                 "Index": str(index),
@@ -1230,8 +1422,12 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                 "Max_Interp_Gap_Frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
                 "Min_Valid_Fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                 "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                "Invalid_Frame_Fraction": qc_summary.get("Invalid_Frame_Fraction", np.nan),
+                "Invalid_Frame_Count": qc_summary.get("Invalid_Frame_Count", np.nan),
+                "Max_Invalid_Fraction": qc_summary.get("Max_Invalid_Fraction", np.nan),
                 "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
                 "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
+                "Interpolatable_Invalid_Fraction": qc_summary.get("Interpolatable_Invalid_Fraction", np.nan),
             })
 
     path_df = pd.DataFrame(records)
@@ -1239,6 +1435,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     if path_df.empty:
         raise ValueError("No valid left-leg TT path efficiency rows were found.")
 
+    # Convert permutation p-values into compact annotations for the plot.
     def significance_label(p_value):
         if pd.isna(p_value):
             return "n.s."
@@ -1251,6 +1448,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         return "n.s."
 
     def run_unpaired_test(data, leg, group_col, group_a, group_b, comparison_type):
+        # Compare two groups within one leg using the repository's unpaired
+        # permutation test on TT path efficiency.
         sub = data[data["Leg"] == leg]
         values_a = sub[sub[group_col] == group_a]["TT_Path_Efficiency"].astype(float).dropna().to_numpy()
         values_b = sub[sub[group_col] == group_b]["TT_Path_Efficiency"].astype(float).dropna().to_numpy()
@@ -1281,6 +1480,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         row["significance"] = significance_label(p_value)
         return row
 
+    # First compare landing outcomes for each leg.
     stat_rows = []
     for leg in legs:
         stat_rows.append(run_unpaired_test(
@@ -1292,6 +1492,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
             "success_vs_failed"
         ))
 
+    # Then compare IT/OT behavior groups when at least two behavior labels are
+    # available in behavior_sources.
     behavior_df = path_df.dropna(subset=["Behavior_Label"]).copy()
     behavior_keys = list(behavior_sources.keys())
     if len(behavior_keys) >= 2:
@@ -1307,6 +1509,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
 
     stat_df = pd.DataFrame(stat_rows)
 
+    # Export data and statistics before plotting so notebook users can inspect
+    # values even if they later change the figure style.
     if save_csv and file_name is not None:
         path_df.to_csv(f"{file_name}_data.csv", index=False)
         stat_df.to_csv(f"{file_name}_permutation_stats.csv", index=False)
@@ -1316,11 +1520,14 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     fig, axes = plt.subplots(1, 1, figsize=(6.8, 7.0))
 
     def add_bracket(ax, x1, x2, y, text):
+        # Draw a simple significance bracket above the dodged stripplot points.
         y_range = ax.get_ylim()[1] - ax.get_ylim()[0]
         h = y_range * 0.025
         ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=1)
         ax.text((x1 + x2) / 2, y + h, text, ha="center", va="bottom", fontsize=11)
 
+    # Main path-efficiency plot: raw trial points grouped by leg and colored by
+    # landing outcome.
     sns.stripplot(
         data=path_df,
         x="Leg",
@@ -1339,6 +1546,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     axes.set_xlabel("")
     axes.set_ylabel("TT path efficiency")
     axes.set_ylim(-0.05, 1.05)
+    # Add one significance bracket per leg for Success vs Failed.
     for leg_i, leg in enumerate(legs):
         stat_match = stat_df[
             (stat_df["Comparison_Type"] == "success_vs_failed")
@@ -1356,6 +1564,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
 
 
 
+    # Save the figure and return the figure/axis plus the data tables.
     if file_name is not None:
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()
@@ -1366,7 +1575,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
 def plot_TT_summary_metrics_vs_LL(
         self,
         group_info,
-        legs=("L-f", "L-m", "L-h"),
+        leg="L-h",
         trial_types=("Landing", "Flying"),
         tau=0.71,
         trajectory_window_mode="mol_adjusted",
@@ -1381,18 +1590,26 @@ def plot_TT_summary_metrics_vs_LL(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7
 ):
     """
-    Plot TT average speed, path efficiency, and path length vs LL.
+    Plot L-hTT path efficiency vs landing latency.
 
-    Statistics are calculated separately for each metric and leg. Each panel
-    reports trial-level Spearman correlation and fly-average Spearman
-    correlation. Permutation p-values are computed by shuffling the y-values
-    within that panel and recalculating Spearman rho.
+    The figure reports trial-level Spearman correlation and fly-average
+    Spearman correlation. Permutation p-values are computed by shuffling the
+    y-values and recalculating Spearman rho.
     """
+    if isinstance(leg, str):
+        target_leg = leg
+    else:
+        target_leg = tuple(leg)[0]
+
+    # Use a local RNG so permutation tests are reproducible and do not affect
+    # other random operations in the notebook/session.
     rng = np.random.default_rng(random_state)
+    # Convert older tracking-QC arguments into a metadata helper used in the
+    # exported metric rows.
     qc_config = tqc.from_legacy_arguments(
         apply_tracking_qc=apply_tracking_qc,
         tracking_error_thresholds=tracking_error_thresholds,
@@ -1400,29 +1617,20 @@ def plot_TT_summary_metrics_vs_LL(
         max_interp_gap_frames=max_interp_gap_frames,
         min_valid_fraction=min_valid_fraction
     )
+    # Trial-level metric rows and QC skip diagnostics are accumulated first,
+    # then converted into DataFrames.
     records = []
     qc_skipped_rows = []
-    metric_options = {
-        "average_speed": {
-            "column": "TT_Average_Speed",
-            "label": "TT average speed (mm/s)",
-            "title": "Average speed",
-        },
-        "path_efficiency": {
-            "column": "TT_Path_Efficiency",
-            "label": "TT path efficiency (displacement/path)",
-            "title": "Path efficiency",
-        },
-        "path_length": {
-            "column": "TT_Path_Length",
-            "label": "TT path length (mm)",
-            "title": "Path length",
-        },
-    }
+    metric_name = "path_efficiency"
+    y_col = "TT_Path_Efficiency"
+    y_label = "L-hTT path efficiency (displacement/path)"
+    metric_title = "Path efficiency"
 
     if trajectory_window_mode not in {"fixed", "mol_adjusted", "SLC_adjusted"}:
         raise ValueError("trajectory_window_mode must be 'fixed', 'mol_adjusted', or 'SLC_adjusted'.")
 
+    # Initialize metadata and kinematic traces if the group has not already been
+    # prepared upstream.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
         group_info.filter_nan_fly()
@@ -1430,10 +1638,13 @@ def plot_TT_summary_metrics_vs_LL(
     group_info.read_kinematic_data(list(trial_types))
     trial_indexes = group_info.get_targeted_trials(list(trial_types))
 
+    # Secondary-contact lookup is only needed when SLC can shorten the TT
+    # trajectory window.
     sc_lookup = {}
     if trajectory_window_mode == "SLC_adjusted":
-        sc_lookup = _load_sc_lookup(self.calculator, sc_csv_path, legs)
+        sc_lookup = _load_sc_lookup(self.calculator, sc_csv_path, (target_leg,))
 
+    # Build one metric row for every valid trial and requested leg.
     for index in trial_indexes:
         key = group_info._trial_key(index[0], index[1])
         if key not in group_info.fly_kinematic_data or key not in group_info.trial_metadata:
@@ -1448,17 +1659,20 @@ def plot_TT_summary_metrics_vs_LL(
         if pd.isna(moc) or pd.isna(fps):
             continue
 
+        # Landing latency supplies the x-axis value for every metric panel.
         ll_s, ll_censored, ll_source = th.landing_latency_seconds(meta, tau)
         if pd.isna(ll_s):
             continue
 
         moc_i = int(moc)
         outcome = th.classify_landing(meta, group_info.latency_threshold)
-        for leg in legs:
+        for leg in (target_leg,):
+            # Analyze the tibia-tarsus endpoint for this leg.
             point_name = f"{leg}TT"
             if point_name not in trial_info.trial_data:
                 continue
 
+            # Pick the analysis endpoint based on the selected window rule.
             end_frame, window_rule, slc_frame, slc_valid = _select_tt_window_end(
                 self.calculator,
                 sc_lookup,
@@ -1477,6 +1691,9 @@ def plot_TT_summary_metrics_vs_LL(
                 continue
 
             if apply_tracking_qc:
+                # QC applies to only the analysis window. Requiring valid start
+                # and end points prevents path metrics from using undefined
+                # endpoints after interpolation.
                 tt_xyz, _, qc_summary, _ = self.calculator.apply_xyz_tracking_qc(
                     trial_info=trial_info,
                     keypoint=point_name,
@@ -1504,11 +1721,17 @@ def plot_TT_summary_metrics_vs_LL(
                     })
                     continue
             else:
+                # Raw mode keeps the original tracked TT coordinates.
                 tt_xyz = self.calculator.ReadAndTranspose(point_name, trial_info)
                 qc_summary = _empty_qc_summary()
+
+            # Slice from MOC through the selected endpoint. end_frame is
+            # inclusive, so add 1 for Python slicing.
             end = min(end_frame + 1, len(tt_xyz))
             tt_seg = tt_xyz[moc_i:end]
 
+            # Calculate the three plotted metrics plus supporting displacement
+            # and duration values.
             average_speed, path_efficiency, path_length, displacement, duration_s = _calculate_tt_metrics(
                 tt_seg,
                 fps,
@@ -1516,6 +1739,8 @@ def plot_TT_summary_metrics_vs_LL(
                 min_path_length=min_path_length
             )
             if all(pd.isna(value) for value in (average_speed, path_efficiency, path_length)):
+                # Metric calculation can fail if too few finite coordinates
+                # remain. Preserve this as a QC diagnostic when QC is enabled.
                 if apply_tracking_qc:
                     qc_skipped_rows.append({
                         "Group_Name": group_info.group_name,
@@ -1532,6 +1757,8 @@ def plot_TT_summary_metrics_vs_LL(
                     })
                 continue
 
+            # Store one long-form row per trial/leg. This table drives all
+            # scatter panels and CSV exports.
             records.append({
                 "Group_Name": group_info.group_name,
                 "Index": str(index),
@@ -1558,8 +1785,12 @@ def plot_TT_summary_metrics_vs_LL(
                 "SLC_Valid_For_Window": slc_valid,
                 **qc_config.output_metadata(),
                 "Valid_Frame_Fraction": qc_summary["Valid_Frame_Fraction"],
+                "Invalid_Frame_Fraction": qc_summary.get("Invalid_Frame_Fraction", np.nan),
+                "Invalid_Frame_Count": qc_summary.get("Invalid_Frame_Count", np.nan),
+                "Max_Invalid_Fraction": qc_summary.get("Max_Invalid_Fraction", np.nan),
                 "Max_Invalid_Gap_Frames": qc_summary["Max_Invalid_Gap_Frames"],
                 "Interpolated_Frame_Count": qc_summary["Interpolated_Frame_Count"],
+                "Interpolatable_Invalid_Fraction": qc_summary.get("Interpolatable_Invalid_Fraction", np.nan),
             })
 
     metric_df = pd.DataFrame(records)
@@ -1569,83 +1800,74 @@ def plot_TT_summary_metrics_vs_LL(
         return None, None, metric_df, pd.DataFrame()
 
 
-    stat_rows = []
-    for leg in legs:
-        leg_df = metric_df[metric_df["Leg"] == leg]
-        for metric_name, metric_info in metric_options.items():
-            y_col = metric_info["column"]
-            clean = leg_df[["Landing_Latency_s", y_col]].dropna()
-            fly_average_clean = (
-                leg_df
-                .groupby("Fly#")[["Landing_Latency_s", y_col]]
-                .mean()
-                .dropna()
-                .reset_index()
-            )
+    # Compute correlations for the single requested L-hTT path-efficiency panel.
+    clean = metric_df[["Landing_Latency_s", y_col]].dropna()
+    fly_average_clean = (
+        metric_df
+        .groupby("Fly#")[["Landing_Latency_s", y_col]]
+        .mean()
+        .dropna()
+        .reset_index()
+    )
+    stat_row = {
+        "Group_Name": group_info.group_name,
+        "Leg": target_leg,
+        "Metric": metric_name,
+        "Metric_Column": y_col,
+        "n": len(clean),
+        "spearman_rho": np.nan,
+        "spearman_p": np.nan,
+        "spearman_permutation_p": np.nan,
+        "fly_average_n": len(fly_average_clean),
+        "fly_average_spearman_rho": np.nan,
+        "fly_average_spearman_p": np.nan,
+        "fly_average_spearman_permutation_p": np.nan,
+        "linear_slope": np.nan,
+        "linear_intercept": np.nan,
+        "linear_r": np.nan,
+        "linear_p": np.nan,
+        "n_perm": n_perm,
+        "Trajectory_Window_Mode": trajectory_window_mode,
+    }
 
-            stat_row = {
-                "Group_Name": group_info.group_name,
-                "Leg": leg,
-                "Metric": metric_name,
-                "Metric_Column": y_col,
-                "n": len(clean),
-                "spearman_rho": np.nan,
-                "spearman_p": np.nan,
-                "spearman_permutation_p": np.nan,
-                "fly_average_n": len(fly_average_clean),
-                "fly_average_spearman_rho": np.nan,
-                "fly_average_spearman_p": np.nan,
-                "fly_average_spearman_permutation_p": np.nan,
-                "linear_slope": np.nan,
-                "linear_intercept": np.nan,
-                "linear_r": np.nan,
-                "linear_p": np.nan,
-                "within_fly_permutation_slope": np.nan,
-                "within_fly_permutation_p": np.nan,
-                "n_perm": n_perm,
-                "Trajectory_Window_Mode": trajectory_window_mode,
-            }
+    if len(clean) >= 3 and clean["Landing_Latency_s"].nunique() >= 2 and clean[y_col].nunique() >= 2:
+        spearman_rho, spearman_p, spearman_perm_p = self.calculator.spearman_permutation_test(
+            clean["Landing_Latency_s"],
+            clean[y_col],
+            n_perm=n_perm,
+            rng=rng
+        )
+        linear = linregress(clean["Landing_Latency_s"], clean[y_col])
+        stat_row.update({
+            "spearman_rho": spearman_rho,
+            "spearman_p": spearman_p,
+            "spearman_permutation_p": spearman_perm_p,
+            "linear_slope": float(linear.slope),
+            "linear_intercept": float(linear.intercept),
+            "linear_r": float(linear.rvalue),
+            "linear_p": float(linear.pvalue),
+        })
 
-            if len(clean) >= 3 and clean["Landing_Latency_s"].nunique() >= 2 and clean[y_col].nunique() >= 2:
-                spearman_rho, spearman_p, spearman_perm_p = self.calculator.spearman_permutation_test(
-                    clean["Landing_Latency_s"],
-                    clean[y_col],
-                    n_perm=n_perm,
-                    rng=rng
-                )
-                linear = linregress(clean["Landing_Latency_s"], clean[y_col])
+    if (
+            len(fly_average_clean) >= 3
+            and fly_average_clean["Landing_Latency_s"].nunique() >= 2
+            and fly_average_clean[y_col].nunique() >= 2
+    ):
+        fly_rho, fly_p, fly_perm_p = self.calculator.spearman_permutation_test(
+            fly_average_clean["Landing_Latency_s"],
+            fly_average_clean[y_col],
+            n_perm=n_perm,
+            rng=rng
+        )
+        stat_row.update({
+            "fly_average_spearman_rho": fly_rho,
+            "fly_average_spearman_p": fly_p,
+            "fly_average_spearman_permutation_p": fly_perm_p,
+        })
 
-                stat_row.update({
-                    "spearman_rho": spearman_rho,
-                    "spearman_p": spearman_p,
-                    "spearman_permutation_p": spearman_perm_p,
-                    "linear_slope": float(linear.slope),
-                    "linear_intercept": float(linear.intercept),
-                    "linear_r": float(linear.rvalue),
-                    "linear_p": float(linear.pvalue),
-                })
+    stat_df = pd.DataFrame([stat_row])
 
-            if (
-                    len(fly_average_clean) >= 3
-                    and fly_average_clean["Landing_Latency_s"].nunique() >= 2
-                    and fly_average_clean[y_col].nunique() >= 2
-            ):
-                fly_rho, fly_p, fly_perm_p = self.calculator.spearman_permutation_test(
-                    fly_average_clean["Landing_Latency_s"],
-                    fly_average_clean[y_col],
-                    n_perm=n_perm,
-                    rng=rng
-                )
-                stat_row.update({
-                    "fly_average_spearman_rho": fly_rho,
-                    "fly_average_spearman_p": fly_p,
-                    "fly_average_spearman_permutation_p": fly_perm_p,
-                })
-
-            stat_rows.append(stat_row)
-
-    stat_df = pd.DataFrame(stat_rows)
-
+    # Save metric and statistics tables before drawing the multi-panel figure.
     if save_csv and file_name is not None:
         metric_df.to_csv(f"{file_name}_data.csv", index=False)
         stat_df.to_csv(f"{file_name}_trend_stats.csv", index=False)
@@ -1657,114 +1879,87 @@ def plot_TT_summary_metrics_vs_LL(
         "Failed": "tab:red",
     }
 
-    fig, axes = plt.subplots(
-        len(metric_options),
-        len(legs),
-        figsize=(4.2 * len(legs), 3.6 * len(metric_options)),
-        sharex=True,
-        squeeze=False
-    )
+    fig, ax = plt.subplots(figsize=(4.6, 3.8))
 
     x_min = metric_df["Landing_Latency_s"].min()
     x_max = metric_df["Landing_Latency_s"].max()
     x_pad = max((x_max - x_min) * 0.05, 0.02)
 
-    for row, (metric_name, metric_info) in enumerate(metric_options.items()):
-        y_col = metric_info["column"]
-        y_values = metric_df[y_col].to_numpy(dtype=float)
-        y_values = y_values[np.isfinite(y_values)]
-        y_min = np.nanmin(y_values)
-        y_max = np.nanmax(y_values)
-        y_pad = max((y_max - y_min) * 0.05, 0.02)
+    y_values = metric_df[y_col].to_numpy(dtype=float)
+    y_values = y_values[np.isfinite(y_values)]
+    y_min = np.nanmin(y_values)
+    y_max = np.nanmax(y_values)
+    y_pad = max((y_max - y_min) * 0.05, 0.02)
 
-        for col, leg in enumerate(legs):
-            ax = axes[row, col]
-            leg_df = metric_df[metric_df["Leg"] == leg]
-            sns.scatterplot(
-                data=leg_df,
-                x="Landing_Latency_s",
-                y=y_col,
-                hue="Outcome",
-                hue_order=["Success", "Failed"],
-                palette=palette,
-                s=45,
-                alpha=0.75,
-                ax=ax
+    sns.scatterplot(
+        data=metric_df,
+        x="Landing_Latency_s",
+        y=y_col,
+        hue="Outcome",
+        hue_order=["Success", "Failed"],
+        palette=palette,
+        s=45,
+        alpha=0.75,
+        ax=ax
+    )
+    if not fly_average_clean.empty:
+        ax.scatter(
+            fly_average_clean["Landing_Latency_s"],
+            fly_average_clean[y_col],
+            color="black",
+            marker="D",
+            s=52,
+            edgecolor="white",
+            linewidth=0.5,
+            zorder=5,
+            label="Fly average"
+        )
+        if (
+                len(fly_average_clean) >= 3
+                and fly_average_clean["Landing_Latency_s"].nunique() >= 2
+                and fly_average_clean[y_col].nunique() >= 2
+        ):
+            fit = linregress(fly_average_clean["Landing_Latency_s"], fly_average_clean[y_col])
+            x_fit = np.linspace(
+                fly_average_clean["Landing_Latency_s"].min(),
+                fly_average_clean["Landing_Latency_s"].max(),
+                100
             )
-            fly_average_df = (
-                leg_df
-                .groupby("Fly#")[["Landing_Latency_s", y_col]]
-                .mean()
-                .dropna()
-                .reset_index()
+            ax.plot(
+                x_fit,
+                fit.intercept + fit.slope * x_fit,
+                color="black",
+                linewidth=1.6,
+                alpha=0.85,
+                label="Fly-average linear fit"
             )
-            if not fly_average_df.empty:
-                ax.scatter(
-                    fly_average_df["Landing_Latency_s"],
-                    fly_average_df[y_col],
-                    color="black",
-                    marker="D",
-                    s=52,
-                    edgecolor="white",
-                    linewidth=0.5,
-                    zorder=5,
-                    label="Fly average"
-                )
-                if (
-                        len(fly_average_df) >= 3
-                        and fly_average_df["Landing_Latency_s"].nunique() >= 2
-                        and fly_average_df[y_col].nunique() >= 2
-                ):
-                    fit = linregress(fly_average_df["Landing_Latency_s"], fly_average_df[y_col])
-                    x_fit = np.linspace(
-                        fly_average_df["Landing_Latency_s"].min(),
-                        fly_average_df["Landing_Latency_s"].max(),
-                        100
-                    )
-                    ax.plot(
-                        x_fit,
-                        fit.intercept + fit.slope * x_fit,
-                        color="black",
-                        linewidth=1.6,
-                        alpha=0.85,
-                        label="Fly-average linear fit"
-                    )
 
-            stat_match = stat_df[
-                (stat_df["Leg"] == leg)
-                & (stat_df["Metric"] == metric_name)
-            ]
-            if not stat_match.empty:
-                rho = stat_match.iloc[0]["spearman_rho"]
-                p_value = stat_match.iloc[0]["spearman_permutation_p"]
-                n_points = int(stat_match.iloc[0]["n"])
-                fly_rho = stat_match.iloc[0]["fly_average_spearman_rho"]
-                fly_p_value = stat_match.iloc[0]["fly_average_spearman_permutation_p"]
-                fly_n = int(stat_match.iloc[0]["fly_average_n"])
-                stat_label = (
-                    f"trial n={n_points}, {pc.format_rho_value(rho)}, perm {pc.format_p_value(p_value)}\n"
-                    f"fly n={fly_n}, {pc.format_rho_value(fly_rho)}, perm {pc.format_p_value(fly_p_value)}"
-                )
-            else:
-                stat_label = "trial n=0, rho=NA, p=NA\nfly n=0, rho=NA, p=NA"
+    rho = stat_df.iloc[0]["spearman_rho"]
+    p_value = stat_df.iloc[0]["spearman_permutation_p"]
+    n_points = int(stat_df.iloc[0]["n"])
+    fly_rho = stat_df.iloc[0]["fly_average_spearman_rho"]
+    fly_p_value = stat_df.iloc[0]["fly_average_spearman_permutation_p"]
+    fly_n = int(stat_df.iloc[0]["fly_average_n"])
+    stat_label = (
+        f"trial n={n_points}, {pc.format_rho_value(rho)}, perm {pc.format_p_value(p_value)}\n"
+        f"fly n={fly_n}, {pc.format_rho_value(fly_rho)}, perm {pc.format_p_value(fly_p_value)}"
+    )
 
-            ax.axvline(group_info.latency_threshold, color="black", linestyle="--", linewidth=1)
-            ax.set_title(f"{leg} TT {metric_info['title']}\n{stat_label}")
-            ax.set_xlabel("Landing latency (s)" if row == len(metric_options) - 1 else "")
-            ax.set_ylabel(metric_info["label"] if col == 0 else "")
-            ax.set_xlim(x_min - x_pad, x_max + x_pad)
-            ax.set_ylim(y_min - y_pad, y_max + y_pad)
-            if row == 0 and col == len(legs) - 1:
-                ax.legend(frameon=False, fontsize=8)
-            else:
-                legend = ax.get_legend()
-                if legend is not None:
-                    legend.remove()
+    ax.axvline(group_info.latency_threshold, color="black", linestyle="--", linewidth=1)
+    ax.set_title(f"{target_leg}TT {metric_title}\n{stat_label}")
+    ax.set_xlabel("Landing latency (s)")
+    ax.set_ylabel(y_label)
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax.legend(frameon=False, fontsize=8)
 
+    # Final figure styling and export.
     sns.despine()
     plt.tight_layout()
     if file_name is not None:
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()
 
-    return fig, axes, metric_df, stat_df
+    return fig, ax, metric_df, stat_df
+
+

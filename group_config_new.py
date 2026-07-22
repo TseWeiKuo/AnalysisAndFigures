@@ -8,8 +8,8 @@ from kinematic_object import Group
 VIDEO_DURATION = 7
 DEFAULT_TRIAL_NUM = 20
 
-DATA_FOLDER = r"C:\Users\wayne\OneDrive\Desktop\KinematicData"
-LANDING_DATA_FOLDER = r"C:\Users\wayne\OneDrive\Desktop\Metadata"
+DATA_FOLDER = r"C:\Users\wayne\OneDrive\Desktop\AnalysisAndFigures\KinematicData"
+LANDING_DATA_FOLDER = r"C:\Users\wayne\OneDrive\Desktop\AnalysisAndFigures\Metadata"
 
 # ------------------------------------------------------------
 # Default key points and angles

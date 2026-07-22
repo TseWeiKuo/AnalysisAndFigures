@@ -9,9 +9,8 @@ This repository contains Python workflows for 3D kinematic analysis, landing pro
 - `group_config_old.py`: legacy configuration kept for comparison.
 - `kinematic_object.py`: `Group`, `Trial`, and `Point` data model and data-loading logic.
 - `kinematic_utilities.py`: geometry, angle, contact-search, and helper routines.
-- `KinematicPlot.py`: plotting and figure-generation functions.
+- `KinematicPlot.py` and `plot_*.py`: plotting and figure-generation functions.
 - `survival_stats_runner.py`: landing probability, survival, and RMST statistics.
-- `Data_organization.py`, `KinematicDataOrganization.py`, `RunVideoAnalysis.py`, `projection_overlay.py`, and `VideoManifestGroupSummary.py`: video, manifest, kinematic organization, and overlay utilities.
 - `SC data/`: small secondary-contact CSV inputs used by analysis scripts.
 - `*.ipynb`: figure-building and exploratory notebook workflows.
 
@@ -41,7 +40,7 @@ pip install numpy pandas matplotlib seaborn scipy scikit-learn openpyxl lifeline
 
 Use 4-space indentation. Prefer `snake_case` for functions and variables and `PascalCase` for classes. Preserve existing public mixed-case method names such as `Calculate_joint_angle`, because external scripts may call them.
 
-Keep changes scoped by responsibility: configuration in `group_config_new.py`, plotting in `KinematicPlot.py`, statistics in `survival_stats_runner.py`, data-model behavior in `kinematic_object.py`, and shared helper logic in `kinematic_utilities.py`.
+Keep changes scoped by responsibility: configuration in `group_config_new.py`, plotting in `KinematicPlot.py` or `plot_*.py`, statistics in `survival_stats_runner.py`, data-model behavior in `kinematic_object.py`, and shared helper logic in `kinematic_utilities.py`.
 
 ## Testing Guidelines
 
@@ -55,7 +54,7 @@ For behavioral changes, run the smallest relevant block in `analyze3D_kinematics
 
 ## Commit & Pull Request Guidelines
 
-Use short, imperative commit messages, for example:
+Use short, descriptive commit messages. Existing history includes update-style messages and concise imperative messages, for example:
 
 ```text
 Fix T2 TiTa parser regression

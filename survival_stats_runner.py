@@ -31,9 +31,14 @@ class SurvivalStatsRunner:
     """
 
     def __init__(self, tau=0.71, random_state=0, platform_offset=0.07, radius=0.07, fps=250):
+        # tau is the right-censoring horizon used for KM/RMST analyses.
         self.tau = tau
         self.random_state = random_state
+        # Keep a runner-local RNG so permutation tests are reproducible without
+        # changing global NumPy random state.
         self.rng = np.random.default_rng(random_state)
+        # Reuse the same calculator/analyzer utilities as the rest of the
+        # kinematic analysis pipeline.
         self.calculator = ku.SimpleCalculation()
         self.analyzer = ku.GroupDataAnalyzer(platform_offset=platform_offset, radius=radius, FPS=fps)
 
@@ -41,12 +46,17 @@ class SurvivalStatsRunner:
     # Preparation helpers
     # ------------------------------------------------------------
     def prepare_group(self, group_info, chr_data=False, use_opto_filter=False):
+        # Initialize the group's manual metadata only when it has not already
+        # been loaded by an upstream notebook/script.
         if len(group_info.trial_metadata) == 0:
             if chr_data:
                 group_info.initialize_Chr_manual_data()
             else:
                 group_info.initialize_manual_data()
 
+        # Choose the filter that matches the planned comparison: optogenetic
+        # paired analyses keep ON/OFF structure; regular analyses remove NaN fly
+        # records.
         if use_opto_filter:
             group_info.filter_opto_data()
         else:
@@ -61,8 +71,11 @@ class SurvivalStatsRunner:
         Returns one row per trial with columns like:
         Fly#, Trial#, Latency, Event, Group_Name, TrialType, Light
         """
+        # Prepare metadata/filtering first, then ask the Group object for the
+        # existing landing-latency KM table.
         self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=use_opto_filter)
         df = group_info.get_LL(return_df=True).copy()
+        # Return a schema-stable empty DataFrame if no rows are available.
         if df is None or len(df) == 0:
             return pd.DataFrame(columns=["Fly#", "Trial#", "Latency", "Event", "Group_Name", "TrialType", "Light"])
         return df
@@ -86,12 +99,18 @@ class SurvivalStatsRunner:
         if threshold is None:
             threshold = self.tau
 
+        # Secondary-contact detection needs initialized metadata plus loaded
+        # Landing/Flying kinematic traces.
         self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=use_opto_filter)
         group_info.read_kinematic_data(["Landing", "Flying"])
 
+        # By default, analyze all targeted Landing/Flying trials. Optogenetic
+        # wrappers can pass ON-only or OFF-only trial indexes.
         if index_to_iterate is None:
             index_to_iterate = group_info.get_targeted_trials(["Landing", "Flying"])
 
+        # Delegate secondary-contact search to the existing analyzer, then
+        # normalize its output into the same columns used by landing latency.
         raw = self.analyzer.get_secondary_contact_kmc_df(
             group_info=group_info,
             index_to_iterate=index_to_iterate,
@@ -107,6 +126,7 @@ class SurvivalStatsRunner:
         df = raw.copy()
 
         # Existing SC code uses lower-case latency/event and tuple-like Index column.
+        # Normalize capitalization so downstream RMST code can be shared.
         if "latency" in df.columns and "Latency" not in df.columns:
             df["Latency"] = df["latency"]
         if "event" in df.columns and "Event" not in df.columns:
@@ -115,6 +135,8 @@ class SurvivalStatsRunner:
         if "Index" not in df.columns:
             raise ValueError("Secondary-contact dataframe must contain an 'Index' column with (Fly, Trial).")
 
+        # Parse each Index back into Fly#/Trial# and recover the light condition
+        # from the group's trial metadata.
         flys, trials, lights = [], [], []
         for idx in df["Index"]:
             fly, trial = self.calculator.parse_index_cell(idx)
@@ -137,13 +159,17 @@ class SurvivalStatsRunner:
     # RMST helpers
     # ------------------------------------------------------------
     def compute_fly_rmst(self, trial_df, fly_col="Fly#", time_col="Latency", event_col="Event"):
+        # Compute one restricted mean survival time value per fly. The fly is
+        # the statistical unit for the runner's primary group comparisons.
         kmf = KaplanMeierFitter()
         rows = []
 
+        # Keep a stable output schema when callers pass an empty trial table.
         if trial_df is None or len(trial_df) == 0:
             return pd.DataFrame(columns=["Fly#", "RMST", "n_trials", "n_events", "event_fraction"])
 
         for fly, sub in trial_df.groupby(fly_col):
+            # Fit a fly-specific KM curve and integrate it up to tau.
             kmf.fit(sub[time_col], event_observed=sub[event_col])
             rows.append({
                 "Fly#": fly,
@@ -189,12 +215,16 @@ class SurvivalStatsRunner:
         Uses fly-level RMST as the statistical unit.
         Returns p-value from permutation test only.
         """
+        # Collapse each trial-level table into fly-level RMST values before
+        # testing group differences.
         fly_a = self.compute_fly_rmst(df_a)
         fly_b = self.compute_fly_rmst(df_b)
 
         x = fly_a["RMST"].values
         y = fly_b["RMST"].values
 
+        # Primary statistic is mean(group B) - mean(group A); p-value comes from
+        # an unpaired label-shuffle permutation test.
         observed_diff, perm_p, perm_dist = self._permutation_test_unpaired(x, y, n_perm=n_perm)
 
         if label_a is None:
@@ -210,6 +240,7 @@ class SurvivalStatsRunner:
         fly_b["Group"] = label_b
         fly_table = pd.concat([fly_a, fly_b], ignore_index=True)
 
+        # Summary table stores the comparison metadata and primary test result.
         summary = pd.DataFrame([{
             "comparison_type": "unpaired_fly_level_rmst",
             "group_a": label_a,
@@ -223,6 +254,7 @@ class SurvivalStatsRunner:
             "tau": self.tau,
         }])
 
+        # Save both the fly-level input table and the one-row summary table.
         fly_table.to_csv(f"{out_prefix}-fly_rmst.csv", index=False)
         summary.to_csv(f"{out_prefix}-summary.csv", index=False)
 
@@ -234,19 +266,24 @@ class SurvivalStatsRunner:
         Uses paired fly-level RMST difference.
         Returns p-value from sign-flip test only.
         """
+        # For paired optogenetic data, each fly must have both OFF and ON trial
+        # subsets. RMST is calculated separately within each light condition.
         kmf = KaplanMeierFitter()
         rows = []
 
         for fly, sub in trial_df.groupby("Fly#"):
+            # Split this fly's trials by light condition.
             on_df = sub[sub["Light"] == on_label]
             off_df = sub[sub["Light"] == off_label]
 
             if len(on_df) == 0 or len(off_df) == 0:
                 continue
 
+            # OFF RMST is the baseline condition.
             kmf.fit(off_df["Latency"], event_observed=off_df["Event"])
             rmst_off = float(restricted_mean_survival_time(kmf, t=self.tau))
 
+            # ON RMST is compared to OFF within the same fly.
             kmf.fit(on_df["Latency"], event_observed=on_df["Event"])
             rmst_on = float(restricted_mean_survival_time(kmf, t=self.tau))
 
@@ -266,9 +303,11 @@ class SurvivalStatsRunner:
         if len(paired) == 0:
             raise ValueError("No paired ON/OFF flies found after filtering.")
 
+        # Test whether paired ON-minus-OFF differences are centered around zero.
         diff = paired["Diff_ON_minus_OFF"].values
         observed_diff, signflip_p, perm_dist = self._signflip_test_paired(diff, n_perm=n_perm)
 
+        # Save a one-row summary with condition means and sign-flip p-value.
         summary = pd.DataFrame([{
             "comparison_type": "paired_fly_level_rmst",
             "group": str(trial_df["Group_Name"].iloc[0]),
@@ -289,6 +328,8 @@ class SurvivalStatsRunner:
     # Convenience wrappers: landing
     # ------------------------------------------------------------
     def analyze_landing_unpaired(self, group_a, group_b, out_prefix, chr_data=False, n_perm=10000):
+        # Build landing-latency trial tables for two independent groups, then
+        # run the shared unpaired fly-level RMST comparison.
         df_a = self.get_landing_trial_df(group_a, chr_data=chr_data, use_opto_filter=False)
         df_b = self.get_landing_trial_df(group_b, chr_data=chr_data, use_opto_filter=False)
         return self.compare_unpaired_groups(
@@ -301,6 +342,8 @@ class SurvivalStatsRunner:
         )
 
     def analyze_landing_opto(self, group_info, out_prefix, chr_data=False, n_perm=10000):
+        # Build one ON/OFF landing-latency trial table and run the paired RMST
+        # comparison within flies.
         df = self.get_landing_trial_df(group_info, chr_data=chr_data, use_opto_filter=True)
         return self.compare_paired_opto(df, out_prefix=out_prefix, n_perm=n_perm)
 
@@ -318,6 +361,8 @@ class SurvivalStatsRunner:
         n_perm=10000,
         force_recompute=False,
     ):
+        # Build secondary-contact trial tables separately for the two groups.
+        # radius_a/radius_b allow group-specific SC search radii when needed.
         df_a = self.get_secondary_contact_trial_df(
             group_a,
             radius=radius_a,
@@ -332,6 +377,7 @@ class SurvivalStatsRunner:
             use_opto_filter=False,
             force_recompute=force_recompute,
         )
+        # Reuse the same unpaired fly-level RMST comparison used for landing.
         return self.compare_unpaired_groups(
             df_a=df_a,
             df_b=df_b,
@@ -350,6 +396,8 @@ class SurvivalStatsRunner:
         n_perm=10000,
         force_recompute=False,
     ):
+        # Get ON and OFF trial indexes from the optogenetic group, compute SC
+        # timing separately for each subset, then concatenate for paired RMST.
         self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=True)
         on_index, off_index = group_info.get_ON_OFF_index()
 
@@ -380,6 +428,8 @@ class SurvivalStatsRunner:
         Primary p-value test for independent-group landing probability.
         Uses one landing probability value per fly.
         """
+        # Prepare both groups with the standard non-opto filtering and retrieve
+        # fly-level landing probabilities.
         if len(group_a.trial_metadata) == 0:
             group_a.initialize_manual_data()
         group_a.filter_nan_fly()
@@ -394,6 +444,8 @@ class SurvivalStatsRunner:
         x = df_a["LandingProb"].values
         y = df_b["LandingProb"].values
 
+        # Compare fly-level landing probabilities with the unpaired permutation
+        # helper used elsewhere in this runner.
         observed_diff, p_value, perm_dist = self._permutation_test_unpaired(x, y, n_perm=n_perm)
 
         if label_a is None:
@@ -406,6 +458,7 @@ class SurvivalStatsRunner:
             df_b.assign(Group=label_b)
         ], ignore_index=True)
 
+        # Save the raw fly-level values and a compact summary row.
         summary = pd.DataFrame([{
             "comparison_type": "unpaired_landing_probability",
             "group_a": label_a,
@@ -429,12 +482,16 @@ class SurvivalStatsRunner:
         Uses one LP_ON and one LP_OFF per fly.
         """
 
+        # Prepare optogenetic metadata and get one OFF/ON landing probability
+        # value per fly.
         if len(group_info.trial_metadata) == 0:
             group_info.initialize_manual_data()
         group_info.filter_opto_data()
 
         combined_df = group_info.get_paired_LP_df().copy()
 
+        # Force OFF before ON so the pivot and difference column have a stable
+        # interpretation.
         combined_df["Group_Name"] = pd.Categorical(
             combined_df["Group_Name"],
             categories=[off_label, on_label],
@@ -445,6 +502,8 @@ class SurvivalStatsRunner:
         paired = combined_df.pivot(index="Fly#", columns="Group_Name", values="LandingProb")
         paired = paired.dropna(subset=[off_label, on_label]).reset_index()
 
+        # Compute the paired effect size for each fly, then run a sign-flip test
+        # on those within-fly differences.
         paired["Diff_ON_minus_OFF"] = paired[on_label] - paired[off_label]
 
         diff = paired["Diff_ON_minus_OFF"].values

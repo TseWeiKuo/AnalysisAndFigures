@@ -11,6 +11,7 @@ import pandas as pd
 import seaborn as sns
 from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
+from openpyxl import load_workbook
 
 
 def _significance_label(p_value, missing_label=""):
@@ -36,8 +37,8 @@ def _detect_chrimson_wing_mol(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -56,10 +57,24 @@ def _detect_chrimson_wing_mol(
         smooth_angle=smooth_angle,
         smooth_window_frames=smooth_window_frames,
         smooth_polyorder=smooth_polyorder,
+        qc_start=window_start,
+        qc_end=window_stop - 1,
         return_qc=apply_tracking_qc
     )
     if apply_tracking_qc:
         angle_data, qc_df = angle_result
+        if not qc_df.empty and not bool(qc_df.iloc[0].get("QC_Passed", True)):
+            qc_record = qc_df.iloc[0].to_dict()
+            return -1, {
+                "Wing_QC_Passed": False,
+                "Wing_QC_Exclusion_Reason": qc_record.get("QC_Exclusion_Reason", "failed wing tracking QC"),
+                "Wing_Window_Valid_Fraction": qc_record.get("Valid_Frame_Fraction", np.nan),
+                "Wing_Window_Invalid_Fraction": qc_record.get("Invalid_Frame_Fraction", np.nan),
+                "Wing_Window_Max_Invalid_Gap_Frames": qc_record.get("Max_Invalid_Gap_Frames", np.nan),
+                "Wing_Window_Start_Frame": int(window_start),
+                "Wing_Window_Stop_Frame": int(window_stop) - 1,
+                "Apply_Tracking_QC": bool(apply_tracking_qc),
+            }, qc_df
     else:
         angle_data = angle_result
         qc_df = pd.DataFrame()
@@ -111,6 +126,194 @@ def _detect_chrimson_wing_mol(
         "Apply_Tracking_QC": bool(apply_tracking_qc),
     }, qc_df
 
+
+def _is_chrimson_landing_label(value):
+    if isinstance(value, str) or pd.isna(value):
+        return False
+    return value >= 0
+
+
+def _write_chrimson_mol_frames(group_info, mol_rows):
+    if not mol_rows:
+        return
+    if group_info.ll_data_path in (None, "", "NoPath"):
+        raise ValueError(f"No LL metadata path is available for {group_info.group_name}.")
+
+    wb = load_workbook(group_info.ll_data_path)
+    ws = wb.active
+
+    header_row = None
+    trial_cols = {}
+    expected_trials = {f"Trial_{trial}" for _, trial, _ in mol_rows}
+
+    for row_idx in range(1, min(ws.max_row, 10) + 1):
+        row_trial_cols = {}
+        for col_idx in range(1, ws.max_column + 1):
+            header = ws.cell(row=row_idx, column=col_idx).value
+            if header is None:
+                continue
+            header_text = str(header).strip()
+            if header_text in expected_trials:
+                row_trial_cols[header_text] = col_idx
+        if row_trial_cols:
+            header_row = row_idx
+            trial_cols = row_trial_cols
+            break
+
+    if header_row is None:
+        raise ValueError(
+            f"Could not find Trial_N headers in LL metadata file: {group_info.ll_data_path}"
+        )
+
+    fly_rows = {}
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        fly_value = ws.cell(row=row_idx, column=1).value
+        if fly_value is None:
+            continue
+        try:
+            fly_rows[int(fly_value)] = row_idx
+        except (TypeError, ValueError):
+            continue
+
+    for fly, trial, mol_frame in mol_rows:
+        trial_header = f"Trial_{trial}"
+        if trial_header not in trial_cols:
+            raise ValueError(
+                f"Could not find column '{trial_header}' in LL metadata file: "
+                f"{group_info.ll_data_path}"
+            )
+        if fly not in fly_rows:
+            fallback_row = header_row + int(fly)
+            if fallback_row > ws.max_row:
+                raise ValueError(
+                    f"Could not find fly {fly} row in LL metadata file: "
+                    f"{group_info.ll_data_path}"
+                )
+            fly_rows[fly] = fallback_row
+
+        ws.cell(row=fly_rows[fly], column=trial_cols[trial_header]).value = int(mol_frame)
+
+    wb.save(group_info.ll_data_path)
+
+
+def _initialize_chrimson_absolute_mol_metadata(
+        group_info,
+        light_on_frame=750,
+        tau=0.71,
+        require_kinematics=False
+):
+    """
+    Initialize CsChrimson metadata from LL sheets that store absolute MOL frames.
+
+    Numeric nonnegative values are treated as absolute MOL frames and converted
+    to latency frames relative to light_on_frame. -1 remains Flying, "NF"
+    remains NF, and blank cells remain NA.
+    """
+    if group_info.ll_data is None:
+        raise ValueError(f"LL/MOL metadata is required for {group_info.group_name}.")
+    if group_info.fps is None or len(group_info.fps) < group_info.total_fly_number:
+        raise ValueError(
+            f"FPS list for {group_info.group_name} must contain at least "
+            f"{group_info.total_fly_number} values."
+        )
+
+    group_info.latency_threshold = tau
+    group_info.landing_trial_index = []
+    group_info.flying_trial_index = []
+    group_info.not_flying_trial_index = []
+    group_info.NA_trial_index = []
+    group_info.trial_metadata = dict()
+    missing_trials = []
+
+    for i in range(group_info.total_fly_number):
+        for t in range(group_info.trial_num):
+            fly = i + 1
+            trial = t + 1
+            key = group_info._trial_key(fly, trial)
+
+            path = None
+            light = None
+            if key in group_info.fly_kinematic_data_path:
+                path = group_info.fly_kinematic_data_path[key]
+                light = group_info._get_opto_label_from_path(path)
+            else:
+                missing_trials.append(key)
+
+            mol_abs = group_info.ll_data.iloc[i, t]
+            if isinstance(mol_abs, str) and mol_abs == "NF":
+                trial_type = "NF"
+                ll_val = mol_abs
+            elif pd.isna(mol_abs):
+                trial_type = "NA"
+                ll_val = np.nan
+            elif mol_abs == -1:
+                trial_type = "Flying"
+                ll_val = -1
+            elif mol_abs >= 0:
+                trial_type = "Landing"
+                ll_val = int(round(mol_abs - light_on_frame))
+            else:
+                trial_type = "Unknown"
+                ll_val = np.nan
+
+            if trial_type == "Unknown":
+                raise ValueError(
+                    f"Cannot classify CsChrimson metadata value for "
+                    f"{group_info.group_name} {key}: {mol_abs}"
+                )
+
+            group_info.trial_metadata[key] = {
+                "Fly#": fly,
+                "Trial#": trial,
+                "LL": ll_val,
+                "MOC": np.nan,
+                "MOL": mol_abs,
+                "fps": group_info.fps[i],
+                "TrialType": trial_type,
+                "Path": path,
+                "Light": light,
+            }
+
+            idx = (fly, trial)
+            if trial_type == "Landing":
+                group_info.landing_trial_index.append(idx)
+            elif trial_type == "Flying":
+                group_info.flying_trial_index.append(idx)
+            elif trial_type == "NF":
+                group_info.not_flying_trial_index.append(idx)
+            elif trial_type == "NA":
+                group_info.NA_trial_index.append(idx)
+
+    if require_kinematics and missing_trials:
+        preview = ", ".join(missing_trials[:10])
+        more = "" if len(missing_trials) <= 10 else f" ... and {len(missing_trials) - 10} more"
+        raise FileNotFoundError(
+            f"Missing kinematic CSVs for Chr group {group_info.group_name}: {preview}{more}"
+        )
+
+
+def get_chrimson_metadata_on_ll_data(
+        group_info,
+        tau=0.71,
+        light_on_frame=750,
+        min_trial_num=8
+):
+    _initialize_chrimson_absolute_mol_metadata(
+        group_info,
+        light_on_frame=light_on_frame,
+        tau=tau
+    )
+    group_info.filter_opto_data(min_trial_num=min_trial_num)
+    ll_df = group_info.get_LL(return_df=True)
+    if ll_df.empty:
+        return pd.DataFrame(columns=["Group", "Latency", "Event", "Fly#", "Apply_Tracking_QC"])
+
+    on_df = ll_df[ll_df["Light"] == "ON"].copy()
+    on_df = on_df.rename(columns={"Group_Name": "Group"})
+    on_df["Apply_Tracking_QC"] = False
+    return on_df[["Group", "Latency", "Event", "Fly#", "Apply_Tracking_QC"]]
+
+
 def plot_chrimson_LP(
         self,
         group_info,
@@ -119,8 +322,8 @@ def plot_chrimson_LP(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -166,6 +369,7 @@ def plot_chrimson_LP(
     Fly_ON_Idx = []
     wing_qc_rows = []
     wing_qc_skipped_rows = []
+    detected_mol_rows = []
 
     ON_index, OFF_index = group_info.get_ON_OFF_index()
 
@@ -187,7 +391,7 @@ def plot_chrimson_LP(
                 Fly_ON_event.append(0)
                 Fly_ON_Idx.append(index[0])
 
-            elif trial_info.LL == 1:
+            elif _is_chrimson_landing_label(trial_info.LL):
                 MOL, wing_qc_summary, wing_qc_df = _detect_chrimson_wing_mol(
                     self,
                     trial_info,
@@ -217,16 +421,27 @@ def plot_chrimson_LP(
                     wing_qc_rows.extend(wing_qc_df.to_dict("records"))
                 if apply_tracking_qc and not wing_qc_summary["Wing_QC_Passed"]:
                     wing_qc_skipped_rows.append(wing_qc_summary.copy())
-                elif MOL == -1 or (MOL / 250) > threshold:
-                    flying_num += 1
-                    Fly_ON_LL.append(threshold)
-                    Fly_ON_event.append(0)
-                    Fly_ON_Idx.append(index[0])
                 else:
-                    landing_num += 1
-                    Fly_ON_LL.append(MOL / 250)
-                    Fly_ON_event.append(1)
-                    Fly_ON_Idx.append(index[0])
+                    if MOL != -1:
+                        mol_frame = int(wing_qc_summary["Wing_Window_Start_Frame"] + MOL)
+                        detected_mol_rows.append((index[0], index[1], mol_frame))
+                        trial_info.LL = mol_frame
+                        key = group_info._trial_key(index[0], index[1])
+                        if key in group_info.trial_metadata:
+                            group_info.trial_metadata[key]["LL"] = mol_frame
+                        if group_info.ll_data is not None:
+                            group_info.ll_data.iloc[index[0] - 1, index[1] - 1] = mol_frame
+
+                    if MOL == -1 or (MOL / 250) > threshold:
+                        flying_num += 1
+                        Fly_ON_LL.append(threshold)
+                        Fly_ON_event.append(0)
+                        Fly_ON_Idx.append(index[0])
+                    else:
+                        landing_num += 1
+                        Fly_ON_LL.append(MOL / 250)
+                        Fly_ON_event.append(1)
+                        Fly_ON_Idx.append(index[0])
 
             else:
                 pass
@@ -241,6 +456,8 @@ def plot_chrimson_LP(
 
                 flying_num = 0
                 landing_num = 0
+
+    _write_chrimson_mol_frames(group_info, detected_mol_rows)
 
     # ------------------------------------------------------------
     # Calculate OFF landing probability
@@ -425,6 +642,139 @@ def plot_chrimson_LP(
 
     return Fly_ON_LL_data
 
+
+def plot_chrimson_LP_metadata(
+        self,
+        group_info,
+        color="red",
+        tau=0.71,
+        light_on_frame=750,
+        min_trial_num=8
+):
+    """
+    Plot paired ON/OFF CsChrimson LP using metadata only.
+
+    The LL metadata sheet is interpreted as absolute MOL frame numbers for
+    landing trials. Latency is computed as (MOL - light_on_frame) / fps, and
+    tau is used as the censoring/landing threshold.
+    """
+    _initialize_chrimson_absolute_mol_metadata(
+        group_info,
+        light_on_frame=light_on_frame,
+        tau=tau
+    )
+    group_info.filter_opto_data(min_trial_num=min_trial_num)
+
+    combined_df = group_info.get_paired_LP_df().copy()
+    if combined_df.empty:
+        raise ValueError(f"No paired ON/OFF metadata LP data found for {group_info.group_name}.")
+
+    combined_df["Group_Name"] = pd.Categorical(
+        combined_df["Group_Name"],
+        categories=["OFF", "ON"],
+        ordered=True
+    )
+    combined_df = combined_df.sort_values(by=["Fly#", "Group_Name"])
+
+    paired_df = combined_df.pivot(index="Fly#", columns="Group_Name", values="LandingProb")
+    paired_df = paired_df.dropna(subset=["OFF", "ON"]).copy()
+    if len(paired_df) >= 2:
+        paired_df["Diff_ON_minus_OFF"] = paired_df["ON"] - paired_df["OFF"]
+        observed_diff, p_val = self.calculator.paired_signflip_permutation_test(
+            paired_df["OFF"].values,
+            paired_df["ON"].values,
+            n_perm=20000,
+            rng=np.random.default_rng(0)
+        )
+        stat_df = pd.DataFrame([{
+            "Group": group_info.group_name,
+            "Test": "paired sign-flip permutation",
+            "Metric": "Metadata landing probability",
+            "n_paired_flies": len(paired_df),
+            "mean_OFF": paired_df["OFF"].mean(),
+            "mean_ON": paired_df["ON"].mean(),
+            "mean_diff_ON_minus_OFF": observed_diff,
+            "p_value": p_val,
+            "n_perm": 20000,
+            "tau": tau,
+            "light_on_frame": light_on_frame,
+        }])
+    else:
+        paired_df["Diff_ON_minus_OFF"] = np.nan
+        p_val = np.nan
+        stat_df = pd.DataFrame()
+
+    mean_color = color
+    plt.figure(figsize=(6, 8))
+    ax = sns.pointplot(
+        data=combined_df,
+        x="Group_Name",
+        y="LandingProb",
+        errorbar=None,
+        color=color,
+        linestyles=" ",
+        markers="o"
+    )
+
+    for fly_id, group in combined_df.groupby("Fly#"):
+        plt.plot(
+            group["Group_Name"],
+            group["LandingProb"],
+            marker="o",
+            markersize=12,
+            color="lightgrey",
+            linewidth=3,
+            zorder=1
+        )
+
+    mean_df = combined_df.groupby("Group_Name", as_index=False)["LandingProb"].mean()
+    plt.plot(
+        mean_df["Group_Name"],
+        mean_df["LandingProb"],
+        color=mean_color,
+        marker="o",
+        markersize=12,
+        linewidth=3,
+        label="Mean",
+        zorder=9
+    )
+
+    y_max = combined_df["LandingProb"].max()
+    bracket_y = min(1.05, y_max + 0.10)
+    text_y = min(1.09, bracket_y + 0.03)
+    h = 0.02
+    ax.plot([0, 0, 1, 1], [bracket_y, bracket_y + h, bracket_y + h, bracket_y], lw=2.5, c="black")
+    ax.text(0.5, text_y, _significance_label(p_val, missing_label="n/a"), ha="center", va="bottom", fontsize=14)
+
+    plt.title("Metadata-Based Landing Probability Across Light Conditions")
+    plt.xlabel(group_info.group_name, fontsize=20)
+    plt.ylabel("Landing Probability", fontsize=20)
+    ax.spines["left"].set_linewidth(3)
+    ax.spines["bottom"].set_linewidth(3)
+    plt.tick_params(axis="y", labelsize=18)
+    plt.tick_params(axis="x", labelsize=18)
+    plt.tick_params(width=3, length=8)
+    plt.yticks([0, 0.5, 1])
+    plt.ylim(-0.1, 1.1)
+    plt.xlim(-0.5, 1.5)
+    sns.despine(trim=True)
+    plt.tight_layout()
+    plt.savefig(f"{group_info.group_name}-chr-LP-metadata.pdf")
+    plt.close()
+
+    paired_df.to_csv(f"{group_info.group_name}-metadata-paired_values.csv")
+    if not stat_df.empty:
+        stat_df.to_csv(f"{group_info.group_name}-chr-LP-metadata-signflip-stat.csv", index=False)
+
+    on_ll_data = get_chrimson_metadata_on_ll_data(
+        group_info,
+        tau=tau,
+        light_on_frame=light_on_frame,
+        min_trial_num=min_trial_num
+    )
+    return on_ll_data
+
+
 def plot_chrimson_LP_change_summary(
         self,
         groups,
@@ -437,8 +787,8 @@ def plot_chrimson_LP_change_summary(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -1039,3 +1389,4 @@ def plot_kmc_and_unpaired_rmst_perm(self,
     stat_df.to_csv(f"{file_name}-pairwise_rmst_permutation.csv", index=False)
 
     return stat_df, fly_rmst_df
+

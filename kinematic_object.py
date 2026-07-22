@@ -292,13 +292,25 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
 # ------------------------------------------------------------
 
 class Point:
-    def __init__(self, name="point", x=None, y=None, z=None, cam_count=None, error=None):
+    def __init__(
+            self,
+            name="point",
+            x=None,
+            y=None,
+            z=None,
+            cam_count=None,
+            error=None,
+            score=None,
+            score_column=None,
+    ):
         self.name = name
         self.x_coord = x
         self.y_coord = y
         self.z_coord = z
         self.camera_count = cam_count
         self.error = error
+        self.score = score
+        self.score_column = score_column
 
 
 class Trial:
@@ -335,13 +347,25 @@ class Trial:
         data = dict()
 
         for j in self.joints:
+            score_column = None
+            for candidate in (
+                    f"{j}_score",
+                    f"{j}_likelihood",
+                    f"{j}_confidence",
+                    f"{j}_probability",
+            ):
+                if candidate in kine_data.columns:
+                    score_column = candidate
+                    break
             data[j] = Point(
                 name=j,
                 x=kine_data[f"{j}_x"],
                 y=kine_data[f"{j}_y"],
                 z=kine_data[f"{j}_z"],
                 cam_count=kine_data[f"{j}_ncams"],
-                error=kine_data[f"{j}_error"]
+                error=kine_data[f"{j}_error"],
+                score=kine_data[score_column] if score_column is not None else None,
+                score_column=score_column,
             )
 
         return data
@@ -578,9 +602,9 @@ class Group:
 
                 ll_val = self.ll_data.iloc[i, t]
 
-                if ll_val == 1:
+                if not isinstance(ll_val, str) and not pd.isna(ll_val) and ll_val >= 0:
                     trial_type = "Landing"
-                    mol_val = 1
+                    mol_val = ll_val
                 elif isinstance(ll_val, str) and ll_val == "NF":
                     trial_type = "NF"
                     mol_val = 100

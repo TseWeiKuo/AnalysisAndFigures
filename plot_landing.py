@@ -2,7 +2,7 @@
 
 Public callers should continue using KinematicPlot.PlotCreator.
 """
-
+import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -39,19 +39,27 @@ def plot_LP_summary(
         box_width=0.22,
         box_softness=0.65
 ):
+    # Combine the per-group landing-probability DataFrames into one table so
+    # the boxplot can be built from a single consistent set of group labels.
     combined_df = pd.concat(data_to_plot, ignore_index=True)
 
+    # Scale the figure width with the number of groups. Each group gets one
+    # categorical x-position, then boxplots and raw points are offset around it.
     fig, ax = plt.subplots(figsize=(len(data_to_plot) * 2, 8))
 
     group_names = combined_df["Group_Name"].unique()
     x_positions = np.arange(len(group_names))
 
+    # Default to a broad categorical palette and one marker style per group
+    # unless the caller passes explicit colors/markers.
     if colors is None:
         colors = sns.color_palette("tab20", len(data_to_plot))
 
     if markers is None:
         markers = ["o"] * len(data_to_plot)
 
+    # Resolve each group's color once. This accepts either a sequence indexed
+    # by plotting order or a dict keyed by group label.
     group_colors = []
     for group in group_names:
         matching_index = next(
@@ -63,9 +71,9 @@ def plot_LP_summary(
         )
         group_colors.append(_get_style(colors, matching_index, group, "black"))
 
-    # ==========================================================
-    # Boxplot shifted slightly LEFT
-    # ==========================================================
+    # Build one distribution of fly-level landing probabilities per group.
+    # The boxplot is shifted slightly left so the summary distribution and
+    # individual fly points remain visually separate.
     box_offset = -0.18
     box_data = []
 
@@ -85,6 +93,8 @@ def plot_LP_summary(
         zorder=1
     )
 
+    # Style boxes with softened group colors by default. A caller can override
+    # this with one shared color, a list of colors, or a dict keyed by group.
     for i, patch in enumerate(bp["boxes"]):
         group_color = group_colors[i]
         if box_color is None:
@@ -104,15 +114,16 @@ def plot_LP_summary(
     for line in bp["medians"]:
         line.set(color="black", linewidth=2)
 
+    # Match whiskers and caps to the group color so the box components stay
+    # readable even when the fill is softened.
     for i, group_color in enumerate(group_colors):
         for line in bp["whiskers"][2 * i:2 * i + 2]:
             line.set(color=group_color, linewidth=2)
         for line in bp["caps"][2 * i:2 * i + 2]:
             line.set(color=group_color, linewidth=2)
 
-    # ==========================================================
-    # Stripplot shifted slightly RIGHT
-    # ==========================================================
+    # Overlay individual fly-level points. Small random x-jitter prevents
+    # points with identical landing probabilities from fully overlapping.
     strip_offset = 0.08
 
     for i, d in enumerate(data_to_plot):
@@ -141,6 +152,7 @@ def plot_LP_summary(
             zorder=10
         )
 
+    # Apply shared axis formatting from PlotCreator, then save the figure.
     ax.set_xticks(x_positions)
     ax.set_xticklabels(group_names, rotation=45)
 
@@ -170,6 +182,9 @@ def plot_LP_summary_from_groups(
 ):
     data_to_plot = []
 
+    # This wrapper accepts Group objects rather than prebuilt DataFrames. It
+    # lazily initializes metadata, filters invalid flies, then reuses the core
+    # plotting function above.
     for group_info in groups:
         if len(group_info.trial_metadata) == 0:
             group_info.initialize_manual_data()
@@ -188,26 +203,31 @@ def plot_LP_summary_from_groups(
     )
 
 def plot_LP_summary_light(self, combined_df, file_name, color):
+    # Work on a copy so sorting and categorical conversion do not mutate the
+    # caller's DataFrame.
     combined_df = combined_df.copy()
     combined_df = combined_df.sort_values(by=["Fly#", "Group_Name"])
 
-    # keep only flies that have both OFF and ON
+    # Keep only flies that have both OFF and ON rows. The paired plot assumes
+    # each fly contributes one value to each light condition.
     fly_counts = combined_df["Fly#"].value_counts()
     paired_flies = fly_counts[fly_counts == 2].index
 
+    # Force OFF before ON so lines connect conditions in the intended order.
     combined_df = combined_df[combined_df["Fly#"].isin(paired_flies)].copy()
     combined_df["Group_Name"] = pd.Categorical(combined_df["Group_Name"], categories=["OFF", "ON"], ordered=True)
     combined_df = combined_df.sort_values(by=["Fly#", "Group_Name"])
 
+    # The pivot table is a paired-data check: rows with missing OFF or ON are
+    # removed. The CSV export is left disabled but can be useful for inspection.
     paired_df = combined_df.pivot(index="Fly#", columns="Group_Name", values="LandingProb")
     paired_df = paired_df.dropna(subset=["OFF", "ON"])
     # paired_df.to_csv(f"{file_name}-paired_values.csv")
 
     fig, ax = plt.subplots(figsize=(4, 7))
 
-    # ------------------------------------------------------------
-    # exact box positions with matplotlib
-    # ------------------------------------------------------------
+    # Optional boxplot code kept here for manual reactivation if a paired-line
+    # plot should also show condition distributions.
     """shift = 0.25
     width = 0.12
 
@@ -227,9 +247,8 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
     ax.boxplot([off_vals], positions=[0 - shift], **common_box_kwargs)
     ax.boxplot([on_vals], positions=[1 + shift], **common_box_kwargs)"""
 
-    # ------------------------------------------------------------
-    # paired lines centered at category positions
-    # ------------------------------------------------------------
+    # Draw one grey connected line per fly to show the within-fly OFF-to-ON
+    # change in landing probability.
     for fly_id, group in combined_df.groupby("Fly#"):
         group = group.sort_values("Group_Name")
         if len(group) == 2:
@@ -243,7 +262,8 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
                 zorder=2
             )
 
-    # mean line centered
+    # Overlay the condition means as a colored line so the average trend is
+    # visible on top of the individual paired fly trajectories.
     mean_df = combined_df.groupby("Group_Name", as_index=False)["LandingProb"].mean()
     ax.plot(
         [0, 1],
@@ -271,6 +291,8 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
     plt.close()
 
 def plot_LP_summary_light_from_group(self, group_info, file_name, color):
+    # Prepare an optogenetic group and delegate the actual plotting to the
+    # DataFrame-based paired-light function.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
         group_info.filter_opto_data()
@@ -288,9 +310,14 @@ def plot_KM_curve(
         opto=False,
         marker_every=None
 ):
+    # Fit and plot one inverted Kaplan-Meier curve per input DataFrame. The
+    # lifelines object returns survival probability; this plot displays
+    # landing probability as 1 - survival.
     fig, ax = plt.subplots(1, 1, figsize=(7, 7))
     kmf = KaplanMeierFitter()
 
+    # Choose default visual styles. Optogenetic OFF/ON curves default to black
+    # so line style or marker can carry the condition difference.
     if colors is None:
         if opto:
             colors = ["black", "black"]
@@ -308,6 +335,8 @@ def plot_KM_curve(
 
     stat_out = []
 
+    # Each DataFrame should contain Latency, Event, and Group_Name columns.
+    # Event marks actual landings; non-events are right-censored observations.
     for i, d in enumerate(data_to_plot):
         if d is None or len(d) == 0:
             continue
@@ -320,6 +349,8 @@ def plot_KM_curve(
             label=label
         )
 
+        # Convert the Kaplan-Meier survival curve into a cumulative landing
+        # curve for easier interpretation in landing-probability figures.
         surv_df = kmf.survival_function_
         time = surv_df.index.values
         survival_prob = surv_df[label].values
@@ -341,6 +372,7 @@ def plot_KM_curve(
             label=label
         )
 
+        # Record simple sample-size and censoring counts alongside the figure.
         stat_out.append({
             "Group": label,
             "n": len(d),
@@ -350,6 +382,8 @@ def plot_KM_curve(
 
     pd.DataFrame(stat_out).to_csv(f"{file_name}-KM_stat.csv", index=False)
 
+    # Apply common axis styling, export the PDF, and close the figure to avoid
+    # keeping matplotlib state alive across batch figure generation.
     ax.legend(frameon=False)
 
     self.formatting(
@@ -380,6 +414,9 @@ def plot_KM_curve_from_groups(
 ):
     data_to_plot = []
 
+    # Convert each Group object into an LL DataFrame. In regular mode each
+    # biological group contributes one curve; in optogenetic mode each group is
+    # split into OFF and ON curves.
     for group_info in groups:
         if len(group_info.trial_metadata) == 0:
             group_info.initialize_manual_data()
@@ -431,9 +468,12 @@ def plot_landing_latency_distribution(
         save_csv=True
 ):
     """Plot all valid raw LL values with a robust median + 2 scaled MAD cutoff."""
+    # Load metadata if this group has not been initialized yet.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
 
+    # Extract raw landing-latency frame counts from metadata, drop early trials,
+    # and convert valid LL values to seconds using each trial's FPS.
     rows = []
     for meta in group_info.trial_metadata.values():
         trial_number = meta.get("Trial#")
@@ -455,12 +495,15 @@ def plot_landing_latency_distribution(
         })
 
     latency_df = pd.DataFrame(rows)
+    # Stop early if the requested exclusion/validity filters remove every row.
     if latency_df.empty:
         raise ValueError(
             f"No valid raw LL values remain for {group_info.group_name} after excluding "
             f"trials 1-{exclude_first_n_trials}."
         )
 
+    # Use median absolute deviation rather than standard deviation so the
+    # threshold is less sensitive to a few unusually long latency trials.
     latency = latency_df["Landing_Latency_s"].to_numpy(dtype=float)
     median = float(np.median(latency))
     raw_mad = float(np.median(np.abs(latency - median)))
@@ -479,6 +522,8 @@ def plot_landing_latency_distribution(
         "Threshold_In_Frames": threshold * float(latency_df["FPS"].median()),
     }])
 
+    # Plot the latency distribution with vertical reference lines for the
+    # robust center and cutoff used to flag long-latency values.
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
     sns.histplot(
         latency,
@@ -523,6 +568,8 @@ def plot_landing_latency_distribution(
     sns.despine()
     plt.tight_layout()
 
+    # Save raw values and the summary threshold table when an output stem is
+    # provided. The figure object is returned for callers that want inspection.
     if file_name is not None:
         fig.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
         if save_csv:
@@ -552,8 +599,8 @@ def plot_it_ot_landing_probability_and_latency(
         apply_tracking_qc=False,
         tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=4,
-        min_valid_fraction=0.8,
+        max_interp_gap_frames=5,
+        min_valid_fraction=0.7,
         smooth_angle=False,
         smooth_window_frames=5,
         smooth_polyorder=2,
@@ -566,8 +613,12 @@ def plot_it_ot_landing_probability_and_latency(
     The trial-level permutation test shuffles success/fail outcomes while
     preserving the IT/OT sample sizes, then recalculates mean difference.
     """
+    # Use a local random generator so jitter and permutation tests are
+    # reproducible without changing NumPy's global random state.
     rng = np.random.default_rng(random_state)
 
+    # Default colors and display names are keyed by behavior labels. Callers can
+    # pass their own mappings when plotting different behavior categories.
     if colors is None:
         colors = {
             "IT": "#8FD694",
@@ -580,6 +631,8 @@ def plot_it_ot_landing_probability_and_latency(
             "OT": "Outward touch",
         }
 
+    # A single behavior source path can be expanded into one marker-selection
+    # source per behavior label. More complex callers can pass the full mapping.
     if isinstance(behavior_sources, (str, os.PathLike)):
         behavior_sources = {
             label: {
@@ -590,12 +643,16 @@ def plot_it_ot_landing_probability_and_latency(
             for label in behavior_labels
         }
 
+    # Ensure metadata and kinematic traces are available before building
+    # trial-level landing and angle summaries.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
         group_info.filter_nan_fly()
 
     group_info.read_kinematic_data(list(trial_types))
 
+    # If the contacted leg is not supplied, infer it from the group name. T1,
+    # T2, and T3 contact groups map to front, middle, and hind right legs.
     if contacted_leg is None:
         contact_leg_map = {
             "T1": "R-f",
@@ -613,22 +670,30 @@ def plot_it_ot_landing_probability_and_latency(
                 "Pass contacted_leg explicitly, for example contacted_leg='R-m'."
             )
 
+    # Convert behavior-source definitions into a fast lookup from trial index
+    # tuple, such as (fly, trial), to behavior label.
     behavior_trial_sets = th.trial_sets_from_behavior_sources(behavior_sources)
     behavior_by_index = {}
     for behavior_label, indexes in behavior_trial_sets.items():
         for index in indexes:
             behavior_by_index[tuple(index)] = behavior_label
 
+    # Define the three points used for the contacted-leg joint angle and build
+    # the common time axis used to resample all angle traces around MOC.
     angle_def = [f"{contacted_leg}CT", f"{contacted_leg}FT", f"{contacted_leg}TT"]
     target_n = int(round((angle_end_s - angle_start_s) * target_fps)) + 1
     target_time = np.linspace(angle_start_s, angle_end_s, target_n)
 
+    # Collect trial-level landing outcomes, angle traces, velocity summaries,
+    # and optional tracking-QC diagnostics in separate row lists. They become
+    # DataFrames after the trial loop.
     trial_rows = []
     angle_trace_rows = []
     angular_velocity_rows = []
     angle_qc_rows = []
     angle_skipped_rows = []
     for index in group_info.get_targeted_trials(list(trial_types)):
+        # Only analyze trials that appear in the IT/OT behavior annotations.
         index_tuple = tuple(index)
         behavior_label = behavior_by_index.get(index_tuple)
         if behavior_label not in behavior_labels:
@@ -638,6 +703,8 @@ def plot_it_ot_landing_probability_and_latency(
         if key not in group_info.trial_metadata:
             continue
 
+        # Convert metadata into an inverted-KM duration/event pair. Successful
+        # landings are events; censored trials contribute duration but no event.
         meta = group_info.trial_metadata[key]
         duration, event = th.inverted_km_latency_event(
             meta,
@@ -660,6 +727,9 @@ def plot_it_ot_landing_probability_and_latency(
             "Threshold_s": tau,
         })
 
+        # Angle analysis is optional per trial. Missing kinematic data or
+        # incomplete MOC-centered windows are recorded so skipped trials can be
+        # audited in the exported QC CSVs.
         if key not in group_info.fly_kinematic_data:
             angle_skipped_rows.append({
                 "Group_Name": group_info.group_name,
@@ -671,6 +741,8 @@ def plot_it_ot_landing_probability_and_latency(
             })
             continue
 
+        # Pull trial-specific timing and frame-rate metadata needed to convert
+        # the MOC-centered time window into frame indices.
         trial_info = group_info.fly_kinematic_data[key]
         moc = trial_info.moc
         fps = trial_info.fps
@@ -695,6 +767,8 @@ def plot_it_ot_landing_probability_and_latency(
             })
             continue
 
+        # Convert the requested seconds around MOC into inclusive frame bounds,
+        # then require the full window to be present in the kinematic trace.
         start_frame = int(round(moc + angle_start_s * fps))
         end_frame = int(round(moc + angle_end_s * fps))
         if start_frame < 0 or end_frame >= trial_info.total_frames_number or end_frame <= start_frame:
@@ -708,6 +782,8 @@ def plot_it_ot_landing_probability_and_latency(
             })
             continue
 
+        # Calculate the contacted-leg joint angle. When tracking QC is enabled,
+        # the calculator also returns a per-angle QC summary.
         angle_result = self.calculator.Calculate_joint_angle(
             trial_info,
             [angle_def],
@@ -719,6 +795,8 @@ def plot_it_ot_landing_probability_and_latency(
             smooth_angle=smooth_angle,
             smooth_window_frames=smooth_window_frames,
             smooth_polyorder=smooth_polyorder,
+            qc_start=start_frame,
+            qc_end=end_frame,
             return_qc=apply_tracking_qc
         )
         if apply_tracking_qc:
@@ -734,8 +812,24 @@ def plot_it_ot_landing_probability_and_latency(
                     "Contacted_Leg": contacted_leg,
                 })
                 angle_qc_rows.append(qc_record)
+                if not bool(qc_record.get("QC_Passed", True)):
+                    angle_skipped_rows.append({
+                        "Group_Name": group_info.group_name,
+                        "Index": str(index),
+                        "Fly#": index[0],
+                        "Trial#": index[1],
+                        "Behavior_Label": behavior_label,
+                        "Contacted_Leg": contacted_leg,
+                        "Joint": angle_def[1],
+                        "Reason": "failed angle tracking QC",
+                        **qc_record,
+                    })
+                    continue
         else:
             angle_data = angle_result
+
+        # Extract the FT-centered joint angle inside the MOC-centered window
+        # and evaluate how much usable data remains after any QC/interpolation.
         angle_trace = angle_data[angle_def[1]]
         source_frames = np.arange(start_frame, end_frame + 1)
         source_time = (source_frames - moc) / fps
@@ -762,6 +856,9 @@ def plot_it_ot_landing_probability_and_latency(
                 "Max_Interp_Gap_Frames": max_interp_gap_frames,
             })
             continue
+
+        # Enforce a minimum number of valid samples so interpolation and
+        # velocity calculations are not based on an underdetermined trace.
         if np.sum(valid) < min_angle_frames:
             angle_skipped_rows.append({
                 "Group_Name": group_info.group_name,
@@ -777,6 +874,8 @@ def plot_it_ot_landing_probability_and_latency(
             })
             continue
 
+        # Resample each trial onto the common time axis. This makes traces from
+        # trials with different FPS directly comparable for averaging.
         resampled_trace = np.interp(
             target_time,
             source_time[valid],
@@ -800,6 +899,8 @@ def plot_it_ot_landing_probability_and_latency(
                 "Smooth_Angle": smooth_angle,
             })
 
+        # Summarize angular velocity in the original sampled window. The
+        # absolute-value option reports speed regardless of movement direction.
         clean_angle = source_trace[valid]
         angular_velocity = np.diff(clean_angle) * fps
         if use_absolute_angular_velocity:
@@ -823,6 +924,8 @@ def plot_it_ot_landing_probability_and_latency(
             "Smooth_Angle": smooth_angle,
         })
 
+    # Materialize all collected rows as DataFrames. The trial table is required;
+    # angle-related tables may be empty if traces were missing or filtered out.
     trial_df = pd.DataFrame(trial_rows)
     if trial_df.empty:
         raise ValueError("No IT/OT-labeled Landing/Flying trials were found.")
@@ -831,6 +934,8 @@ def plot_it_ot_landing_probability_and_latency(
     angle_qc_df = pd.DataFrame(angle_qc_rows)
     angle_skipped_df = pd.DataFrame(angle_skipped_rows)
 
+    # Collapse trial-level success/failure values into fly-wise landing
+    # probabilities for the IT/OT summary plot.
     fly_lp_df = (
         trial_df
         .groupby(["Fly#", "Behavior_Label", "Behavior_Display"])
@@ -846,6 +951,9 @@ def plot_it_ot_landing_probability_and_latency(
         values = trial_df.loc[trial_df["Behavior_Label"] == label, "Success"].astype(float)
         return np.nan if values.empty else float(values.mean())
 
+    # Trial-level permutation test: keep the observed IT/OT sample sizes, shuffle
+    # success outcomes, and compare shuffled mean differences to the observed
+    # OT-minus-IT difference.
     observed_diff = trial_mean(behavior_labels[1]) - trial_mean(behavior_labels[0])
     label_counts = [int((trial_df["Behavior_Label"] == label).sum()) for label in behavior_labels]
     outcomes = trial_df["Success"].astype(float).to_numpy()
@@ -877,6 +985,8 @@ def plot_it_ot_landing_probability_and_latency(
         "n_perm": n_perm,
     }])
 
+    # Export all intermediate tables so the plotted values, statistics, angle
+    # traces, and QC decisions can be inspected outside matplotlib.
     if save_csv and file_name is not None:
         trial_df.to_csv(f"{file_name}_trial_data.csv", index=False)
         fly_lp_df.to_csv(f"{file_name}_fly_landing_probability.csv", index=False)
@@ -889,6 +999,7 @@ def plot_it_ot_landing_probability_and_latency(
             angle_qc_df.to_csv(f"{file_name}_FT_angle_qc_summary.csv", index=False)
             angle_skipped_df.to_csv(f"{file_name}_FT_angle_qc_skipped_trials.csv", index=False)
 
+    # Convert p-values into compact annotations for the figures.
     def significance_label(p):
         if pd.isna(p):
             return "n.s."
@@ -900,6 +1011,9 @@ def plot_it_ot_landing_probability_and_latency(
             return "*"
         return "n.s."
 
+    # Figure 1: fly-wise landing probability. Boxes show the distribution of
+    # fly means; jittered points show individual flies and point area reflects
+    # how many trials contributed to that fly's probability.
     fig_lp, ax_lp = plt.subplots(figsize=(4.8, 4.2))
     positions = np.arange(len(behavior_labels), dtype=float)
     box_positions = positions - 0.16
@@ -942,6 +1056,7 @@ def plot_it_ot_landing_probability_and_latency(
                 linewidth=0.4,
             )
 
+    # Draw a simple bracket and annotate it with the permutation-test result.
     y_bracket = 1.03
     ax_lp.plot(
         [point_positions[0], point_positions[0], point_positions[1], point_positions[1]],
@@ -962,6 +1077,8 @@ def plot_it_ot_landing_probability_and_latency(
         fig_lp.savefig(f"{file_name}_landing_probability.pdf", dpi=300, bbox_inches="tight")
     plt.close(fig_lp)
 
+    # Figure 2: inverted Kaplan-Meier landing latency. Each behavior label gets
+    # one cumulative landing-probability curve and a count of events/trials.
     fig_km, ax_km = plt.subplots(figsize=(5.4, 4.2))
     kmf = KaplanMeierFitter()
     km_rows = []
@@ -994,6 +1111,8 @@ def plot_it_ot_landing_probability_and_latency(
             "median_survival_time": kmf.median_survival_time_,
         })
 
+    # Run a log-rank test between the first two behavior labels when both have
+    # data, then export the test result for reporting.
     km_stat_df = pd.DataFrame(km_rows)
     logrank_df = pd.DataFrame()
     logrank_p = np.nan
@@ -1024,6 +1143,7 @@ def plot_it_ot_landing_probability_and_latency(
         if not logrank_df.empty:
             logrank_df.to_csv(f"{file_name}_km_logrank.csv", index=False)
 
+    # Finish the KM axes, place the log-rank significance label, and save.
     ax_km.set_xlim(0, tau)
     ax_km.set_ylim(-0.05, 1.05)
     ax_km.set_xlabel("Landing latency after MOC (s)")
@@ -1046,6 +1166,9 @@ def plot_it_ot_landing_probability_and_latency(
         fig_km.savefig(f"{file_name}_landing_latency_inverted_KM.pdf", dpi=300, bbox_inches="tight")
     plt.close(fig_km)
 
+    # Figure 3: mean FT angle trace around MOC. Traces are averaged by behavior
+    # label after resampling, with SEM ribbons when more than one trial
+    # contributes at a time point.
     fig_angle, ax_angle = plt.subplots(figsize=(5.6, 4.0))
     plotted_angle_values = []
     angle_count_lines = []
@@ -1089,6 +1212,8 @@ def plot_it_ot_landing_probability_and_latency(
                 alpha=0.20,
                 linewidth=0
             )
+
+    # Add MOC reference line, behavior-specific sample counts, and labels.
     ax_angle.axvline(0, color="black", linestyle="--", linewidth=1)
     ax_angle.set_xlabel("Time from MOC (s)")
     ax_angle.set_ylabel(f"{contacted_leg} FT angle (deg)")
@@ -1106,6 +1231,9 @@ def plot_it_ot_landing_probability_and_latency(
             ha="left",
             va="top",
         )
+
+    # Autoscale y-limits to the data that were actually plotted, including SEM
+    # bands, with a small padding so traces do not sit on the frame.
     finite_arrays = [
         np.asarray(values, dtype=float)[np.isfinite(values)]
         for values in plotted_angle_values
@@ -1125,8 +1253,11 @@ def plot_it_ot_landing_probability_and_latency(
     plt.close(fig_angle)
 
 
+    # Return figure handles and DataFrames so notebook callers can inspect or
+    # reuse the outputs without re-reading the CSV files.
     return (
         fig_lp, ax_lp, fig_km, ax_km, fig_angle, ax_angle,
         fly_lp_df, trial_df, stat_df, km_stat_df, logrank_df,
         angle_trace_df, angular_velocity_df,
     )
+
