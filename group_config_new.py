@@ -650,7 +650,7 @@ def build_one_group(group_key):
         group_name=info["group_name"],
         joints=KEY_POINTS,
         total_fly_number=FLY_NUM[group_key],
-        fps=FPS[group_key],
+        fps=FPS.get(group_key),
         trial_num=get_trial_num(group_key),
         trials_offset=TRIAL_OFFSET[group_key],
         video_duration=VIDEO_DURATION

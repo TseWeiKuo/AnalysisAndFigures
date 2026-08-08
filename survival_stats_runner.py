@@ -40,7 +40,7 @@ class SurvivalStatsRunner:
         # Reuse the same calculator/analyzer utilities as the rest of the
         # kinematic analysis pipeline.
         self.calculator = ku.SimpleCalculation()
-        self.analyzer = ku.GroupDataAnalyzer(platform_offset=platform_offset, radius=radius, FPS=fps)
+        self.analyzer = ku.GroupDataAnalyzer()
 
     # ------------------------------------------------------------
     # Preparation helpers
@@ -79,81 +79,6 @@ class SurvivalStatsRunner:
         if df is None or len(df) == 0:
             return pd.DataFrame(columns=["Fly#", "Trial#", "Latency", "Event", "Group_Name", "TrialType", "Light"])
         return df
-
-    def get_secondary_contact_trial_df(
-        self,
-        group_info,
-        radius=0.4,
-        threshold=None,
-        chr_data=False,
-        use_opto_filter=False,
-        force_recompute=False,
-        filename="",
-        index_to_iterate=None,
-    ):
-        """
-        Reuse your existing GroupDataAnalyzer.get_secondary_contact_kmc_df().
-        Output columns are standardized to:
-        Fly#, Trial#, Latency, Event, Group_Name, Light
-        """
-        if threshold is None:
-            threshold = self.tau
-
-        # Secondary-contact detection needs initialized metadata plus loaded
-        # Landing/Flying kinematic traces.
-        self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=use_opto_filter)
-        group_info.read_kinematic_data(["Landing", "Flying"])
-
-        # By default, analyze all targeted Landing/Flying trials. Optogenetic
-        # wrappers can pass ON-only or OFF-only trial indexes.
-        if index_to_iterate is None:
-            index_to_iterate = group_info.get_targeted_trials(["Landing", "Flying"])
-
-        # Delegate secondary-contact search to the existing analyzer, then
-        # normalize its output into the same columns used by landing latency.
-        raw = self.analyzer.get_secondary_contact_kmc_df(
-            group_info=group_info,
-            index_to_iterate=index_to_iterate,
-            radius=radius,
-            threshold=threshold,
-            filename=filename,
-            force_recompute=force_recompute,
-        )
-
-        if raw is None or len(raw) == 0:
-            return pd.DataFrame(columns=["Fly#", "Trial#", "Latency", "Event", "Group_Name", "Light"])
-
-        df = raw.copy()
-
-        # Existing SC code uses lower-case latency/event and tuple-like Index column.
-        # Normalize capitalization so downstream RMST code can be shared.
-        if "latency" in df.columns and "Latency" not in df.columns:
-            df["Latency"] = df["latency"]
-        if "event" in df.columns and "Event" not in df.columns:
-            df["Event"] = df["event"]
-
-        if "Index" not in df.columns:
-            raise ValueError("Secondary-contact dataframe must contain an 'Index' column with (Fly, Trial).")
-
-        # Parse each Index back into Fly#/Trial# and recover the light condition
-        # from the group's trial metadata.
-        flys, trials, lights = [], [], []
-        for idx in df["Index"]:
-            fly, trial = self.calculator.parse_index_cell(idx)
-            flys.append(fly)
-            trials.append(trial)
-            meta = group_info.trial_metadata[group_info._trial_key(fly, trial)]
-            lights.append(meta["Light"])
-
-        out = pd.DataFrame({
-            "Fly#": flys,
-            "Trial#": trials,
-            "Latency": df["Latency"].astype(float),
-            "Event": df["Event"].astype(int),
-            "Group_Name": group_info.group_name,
-            "Light": lights,
-        })
-        return out
 
     # ------------------------------------------------------------
     # RMST helpers
@@ -346,82 +271,6 @@ class SurvivalStatsRunner:
         # comparison within flies.
         df = self.get_landing_trial_df(group_info, chr_data=chr_data, use_opto_filter=True)
         return self.compare_paired_opto(df, out_prefix=out_prefix, n_perm=n_perm)
-
-    # ------------------------------------------------------------
-    # Convenience wrappers: secondary contact
-    # ------------------------------------------------------------
-    def analyze_secondary_unpaired(
-        self,
-        group_a,
-        group_b,
-        out_prefix,
-        radius_a=0.4,
-        radius_b=0.4,
-        chr_data=False,
-        n_perm=10000,
-        force_recompute=False,
-    ):
-        # Build secondary-contact trial tables separately for the two groups.
-        # radius_a/radius_b allow group-specific SC search radii when needed.
-        df_a = self.get_secondary_contact_trial_df(
-            group_a,
-            radius=radius_a,
-            chr_data=chr_data,
-            use_opto_filter=False,
-            force_recompute=force_recompute,
-        )
-        df_b = self.get_secondary_contact_trial_df(
-            group_b,
-            radius=radius_b,
-            chr_data=chr_data,
-            use_opto_filter=False,
-            force_recompute=force_recompute,
-        )
-        # Reuse the same unpaired fly-level RMST comparison used for landing.
-        return self.compare_unpaired_groups(
-            df_a=df_a,
-            df_b=df_b,
-            out_prefix=out_prefix,
-            label_a=group_a.group_name,
-            label_b=group_b.group_name,
-            n_perm=n_perm,
-        )
-
-    def analyze_secondary_opto(
-        self,
-        group_info,
-        out_prefix,
-        radius=0.4,
-        chr_data=False,
-        n_perm=10000,
-        force_recompute=False,
-    ):
-        # Get ON and OFF trial indexes from the optogenetic group, compute SC
-        # timing separately for each subset, then concatenate for paired RMST.
-        self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=True)
-        on_index, off_index = group_info.get_ON_OFF_index()
-
-        on_df = self.get_secondary_contact_trial_df(
-            group_info,
-            radius=radius,
-            chr_data=chr_data,
-            use_opto_filter=True,
-            force_recompute=force_recompute,
-            filename="ON",
-            index_to_iterate=on_index,
-        )
-        off_df = self.get_secondary_contact_trial_df(
-            group_info,
-            radius=radius,
-            chr_data=chr_data,
-            use_opto_filter=True,
-            force_recompute=force_recompute,
-            filename="OFF",
-            index_to_iterate=off_index,
-        )
-
-        trial_df = pd.concat([off_df, on_df], ignore_index=True)
-        return self.compare_paired_opto(trial_df, out_prefix=out_prefix, n_perm=n_perm)
 
     def compare_lp_unpaired(self, group_a, group_b, out_prefix, label_a=None, label_b=None, n_perm=10000):
         """

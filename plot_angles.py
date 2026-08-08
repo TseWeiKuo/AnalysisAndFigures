@@ -219,9 +219,14 @@ def plot_wt_contact_group_angle_traces(
         min_cameras=2,
         max_interp_gap_frames=5,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=False,
+        smooth_method="savgol",
         smooth_window_frames=5,
         smooth_polyorder=2,
+        smooth_alpha=0.4,
         save_csv=True
 ):
     """
@@ -344,9 +349,14 @@ def plot_wt_contact_group_angle_traces(
                 min_cameras=min_cameras,
                 max_interp_gap_frames=max_interp_gap_frames,
                 min_valid_fraction=min_valid_fraction,
+                error_max=error_max,
+                score_min=score_min,
+                require_score=require_score,
                 smooth_angle=smooth_angle,
+                smooth_method=smooth_method,
                 smooth_window_frames=smooth_window_frames,
                 smooth_polyorder=smooth_polyorder,
+                smooth_alpha=smooth_alpha,
                 qc_start=start_frame,
                 qc_end=end_frame,
                 return_qc=apply_tracking_qc
@@ -489,7 +499,9 @@ def plot_wt_contact_group_angle_traces(
                     "max_interp_gap_frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
                     "min_valid_fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                     "smooth_angle": smooth_angle,
+                    "smooth_method": smooth_method if smooth_angle else "",
                     "smooth_window_frames": smooth_window_frames if smooth_angle else np.nan,
+                    "smooth_alpha": smooth_alpha if smooth_angle else np.nan,
                 })
 
                 if n_trials == 0:

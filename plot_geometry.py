@@ -164,6 +164,9 @@ def _collect_TT_MOC_to_SLC_projected_data(
         min_cameras,
         max_interp_gap_frames,
         min_valid_fraction,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
 ):
     """Collect projected TT trajectory/endpoint data for combined TT plots."""
     # Validate mode arguments early so downstream geometric assumptions are
@@ -414,6 +417,9 @@ def _collect_TT_MOC_to_SLC_projected_data(
                         keypoint=joint,
                         min_cameras=min_cameras,
                         error_thresholds=tracking_error_thresholds,
+                        error_max=error_max,
+                        score_min=score_min,
+                        require_score=require_score,
                         max_interp_gap_frames=max_interp_gap_frames,
                         min_valid_fraction=min_valid_fraction,
                         start_frame=moc,
@@ -590,6 +596,9 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         min_cameras=2,
         max_interp_gap_frames=5,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         save_csv=True
 ):
     """
@@ -662,6 +671,9 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
         min_cameras=min_cameras,
         max_interp_gap_frames=max_interp_gap_frames,
         min_valid_fraction=min_valid_fraction,
+        error_max=error_max,
+        score_min=score_min,
+        require_score=require_score,
     )
 
     # Convert MOC and endpoint point rows into displacement vectors. Each vector
@@ -1211,7 +1223,10 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         tracking_error_thresholds=None,
         min_cameras=2,
         max_interp_gap_frames=5,
-        min_valid_fraction=0.7
+        min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False
 ):
     """
     Plot left-leg TT path efficiency grouped by outcome and IT/OT behavior.
@@ -1337,6 +1352,9 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                     keypoint=tt_point,
                     min_cameras=min_cameras,
                     error_thresholds=tracking_error_thresholds,
+                    error_max=error_max,
+                    score_min=score_min,
+                    require_score=require_score,
                     max_interp_gap_frames=max_interp_gap_frames,
                     min_valid_fraction=min_valid_fraction,
                     start_frame=moc_i,
@@ -1591,7 +1609,10 @@ def plot_TT_summary_metrics_vs_LL(
         tracking_error_thresholds=None,
         min_cameras=2,
         max_interp_gap_frames=5,
-        min_valid_fraction=0.7
+        min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False
 ):
     """
     Plot L-hTT path efficiency vs landing latency.
@@ -1615,7 +1636,10 @@ def plot_TT_summary_metrics_vs_LL(
         tracking_error_thresholds=tracking_error_thresholds,
         min_cameras=min_cameras,
         max_interp_gap_frames=max_interp_gap_frames,
-        min_valid_fraction=min_valid_fraction
+        min_valid_fraction=min_valid_fraction,
+        error_max=error_max,
+        score_min=score_min,
+        require_score=require_score
     )
     # Trial-level metric rows and QC skip diagnostics are accumulated first,
     # then converted into DataFrames.
@@ -1699,6 +1723,9 @@ def plot_TT_summary_metrics_vs_LL(
                     keypoint=point_name,
                     min_cameras=min_cameras,
                     error_thresholds=tracking_error_thresholds,
+                    error_max=error_max,
+                    score_min=score_min,
+                    require_score=require_score,
                     max_interp_gap_frames=max_interp_gap_frames,
                     min_valid_fraction=min_valid_fraction,
                     start_frame=moc_i,

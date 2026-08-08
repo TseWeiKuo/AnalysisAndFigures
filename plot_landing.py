@@ -9,6 +9,7 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import colors as mcolors
 from lifelines import KaplanMeierFitter
+from lifelines.statistics import logrank_test
 
 import trial_helpers as th
 
@@ -601,9 +602,14 @@ def plot_it_ot_landing_probability_and_latency(
         min_cameras=2,
         max_interp_gap_frames=5,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=False,
+        smooth_method="savgol",
         smooth_window_frames=5,
         smooth_polyorder=2,
+        smooth_alpha=0.4,
         save_csv=True
 ):
     """
@@ -612,6 +618,9 @@ def plot_it_ot_landing_probability_and_latency(
     Fly-wise LP is # successful behavior trials / # total behavior trials.
     The trial-level permutation test shuffles success/fail outcomes while
     preserving the IT/OT sample sizes, then recalculates mean difference.
+
+    The FT angle trace is baseline-corrected per trial by subtracting that
+    trial's mean angle from angle_start_s up to, but not including, MOC.
     """
     # Use a local random generator so jitter and permutation tests are
     # reproducible without changing NumPy's global random state.
@@ -683,6 +692,9 @@ def plot_it_ot_landing_probability_and_latency(
     angle_def = [f"{contacted_leg}CT", f"{contacted_leg}FT", f"{contacted_leg}TT"]
     target_n = int(round((angle_end_s - angle_start_s) * target_fps)) + 1
     target_time = np.linspace(angle_start_s, angle_end_s, target_n)
+    baseline_mask = (target_time >= angle_start_s) & (target_time < 0)
+    if not np.any(baseline_mask):
+        raise ValueError("The angle trace window must include pre-MOC samples for baseline correction.")
 
     # Collect trial-level landing outcomes, angle traces, velocity summaries,
     # and optional tracking-QC diagnostics in separate row lists. They become
@@ -792,9 +804,14 @@ def plot_it_ot_landing_probability_and_latency(
             min_cameras=min_cameras,
             max_interp_gap_frames=max_interp_gap_frames,
             min_valid_fraction=min_valid_fraction,
+            error_max=error_max,
+            score_min=score_min,
+            require_score=require_score,
             smooth_angle=smooth_angle,
+            smooth_method=smooth_method,
             smooth_window_frames=smooth_window_frames,
             smooth_polyorder=smooth_polyorder,
+            smooth_alpha=smooth_alpha,
             qc_start=start_frame,
             qc_end=end_frame,
             return_qc=apply_tracking_qc
@@ -883,6 +900,24 @@ def plot_it_ot_landing_probability_and_latency(
             left=np.nan,
             right=np.nan
         )
+        baseline_values = resampled_trace[baseline_mask]
+        baseline_values = baseline_values[np.isfinite(baseline_values)]
+        if len(baseline_values) == 0:
+            angle_skipped_rows.append({
+                "Group_Name": group_info.group_name,
+                "Index": str(index),
+                "Fly#": index[0],
+                "Trial#": index[1],
+                "Behavior_Label": behavior_label,
+                "Contacted_Leg": contacted_leg,
+                "Joint": angle_def[1],
+                "Reason": "no finite baseline angle samples",
+                "Baseline_Start_s": angle_start_s,
+                "Baseline_End_s": 0.0,
+            })
+            continue
+        baseline_mean = float(np.nanmean(baseline_values))
+        resampled_trace = resampled_trace - baseline_mean
         for time_s, angle_value in zip(target_time, resampled_trace):
             angle_trace_rows.append({
                 "Group_Name": group_info.group_name,
@@ -895,8 +930,13 @@ def plot_it_ot_landing_probability_and_latency(
                 "Joint": angle_def[1],
                 "Time_From_MOC_s": time_s,
                 "Angle_deg": angle_value,
+                "Baseline_Mean_Angle_deg": baseline_mean,
+                "Baseline_Start_s": angle_start_s,
+                "Baseline_End_s": 0.0,
                 "Apply_Tracking_QC": apply_tracking_qc,
                 "Smooth_Angle": smooth_angle,
+                "Smooth_Method": smooth_method if smooth_angle else "",
+                "Smooth_Alpha": smooth_alpha if smooth_angle else np.nan,
             })
 
         # Summarize angular velocity in the original sampled window. The
@@ -922,6 +962,8 @@ def plot_it_ot_landing_probability_and_latency(
             "Use_Absolute_Angular_Velocity": use_absolute_angular_velocity,
             "Apply_Tracking_QC": apply_tracking_qc,
             "Smooth_Angle": smooth_angle,
+            "Smooth_Method": smooth_method if smooth_angle else "",
+            "Smooth_Alpha": smooth_alpha if smooth_angle else np.nan,
         })
 
     # Materialize all collected rows as DataFrames. The trial table is required;
@@ -1216,9 +1258,9 @@ def plot_it_ot_landing_probability_and_latency(
     # Add MOC reference line, behavior-specific sample counts, and labels.
     ax_angle.axvline(0, color="black", linestyle="--", linewidth=1)
     ax_angle.set_xlabel("Time from MOC (s)")
-    ax_angle.set_ylabel(f"{contacted_leg} FT angle (deg)")
+    ax_angle.set_ylabel(f"{contacted_leg} FT angle change (deg)")
     behavior_title = "/".join(behavior_display_names.get(label, label) for label in behavior_labels)
-    ax_angle.set_title(f"{group_info.group_name}: {behavior_title} {contacted_leg} FT angle trace")
+    ax_angle.set_title(f"{group_info.group_name}: {behavior_title} {contacted_leg} FT angle change")
     ax_angle.set_xlim(angle_start_s, angle_end_s)
     for line_i, (count_text, count_color) in enumerate(angle_count_lines):
         ax_angle.text(

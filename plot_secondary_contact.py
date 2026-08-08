@@ -749,19 +749,15 @@ def plot_valid_sc_count_vs_landing_latency(
         save_csv=True
 ):
     """
-    Plot trial-wise number of valid SC events against raw landing latency.
+    Plot trial-wise number of valid SC events against raw landing latency for
+    one or more contact groups.
 
     Success is defined as Landing with LL/fps <= group latency threshold.
     Failed includes flying trials and landing trials above threshold.
 
-    group_info can be one Group, a list/tuple of Groups, or a dict such as
-    {"T1": groups["WT_T1_TTa"], "T2": ..., "T3": ...}. When plotting
-    multiple contact groups, sc_csv_path must be a dict keyed by group label
-    or group name. Contact groups are shown as offset subgroups at each
-    valid-contact count; success is filled and failed is hollow.
+    Contact groups are pooled visually. Success trials are blue and failed
+    trials are red.
     """
-    # Normalize group input to labeled group items so the same plotting code
-    # handles one group, a list of groups, or a dict of named groups.
     if isinstance(group_info, dict):
         group_items = list(group_info.items())
     elif isinstance(group_info, (list, tuple)):
@@ -769,28 +765,23 @@ def plot_valid_sc_count_vs_landing_latency(
     else:
         group_items = [(group_info.group_name, group_info)]
 
-    # A single SC CSV path is valid only for one group. Multi-group plots need a
-    # path mapping keyed by group label or group name.
+    # Accept either a direct SC CSV path for one group or a mapping keyed by
+    # contact-group label or group name.
     if not isinstance(sc_csv_path, dict):
         if len(group_items) != 1:
-            raise ValueError("sc_csv_path must be a dict when plotting multiple groups.")
-        sc_csv_paths = {group_items[0][0]: sc_csv_path}
+            raise ValueError("A mapping of SC CSV paths is required when plotting multiple groups.")
+        group_label, _ = group_items[0]
+        sc_csv_paths = {group_label: sc_csv_path}
     else:
         sc_csv_paths = sc_csv_path
 
-    # Resolve one color per plotted contact group.
     if colors is None:
-        palette = sns.color_palette("tab10", len(group_items))
-        colors = {label: palette[i] for i, (label, _) in enumerate(group_items)}
+        colors = {"Success": "tab:blue", "Failed": "tab:red"}
     elif not isinstance(colors, dict):
-        colors = {label: colors[i % len(colors)] for i, (label, _) in enumerate(group_items)}
-    elif not any(label in colors or group.group_name in colors for label, group in group_items):
-        palette = sns.color_palette("tab10", len(group_items))
-        colors = {label: palette[i] for i, (label, _) in enumerate(group_items)}
-
-    def group_color(group_label, group):
-        # Prefer explicit plot label colors, then Group.group_name colors.
-        return colors.get(group_label, colors.get(group.group_name, "black"))
+        colors = {
+            "Success": colors[0],
+            "Failed": colors[1] if len(colors) > 1 else colors[0],
+        }
 
     def classify_trial(group, meta):
         # Success is a landing trial whose raw LL/fps is within the group's
@@ -887,91 +878,59 @@ def plot_valid_sc_count_vs_landing_latency(
     if save_csv and file_name is not None:
         count_df.to_csv(f"{file_name}_data.csv", index=False)
 
-    fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    group_labels = [label for label, _ in group_items]
-    # Multiple contact groups are offset horizontally around each integer SC
-    # count to avoid complete overlap.
-    if len(group_labels) == 1:
-        offsets = {group_labels[0]: 0.0}
-    else:
-        offsets = {
-            label: offset
-            for label, offset in zip(group_labels, np.linspace(-subgroup_width, subgroup_width, len(group_labels)))
-        }
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
 
-    # Plot success and failed trials separately so success can be filled and
-    # failed can be hollow while sharing the same group color.
+    # Plot all contact groups together; outcome color is the only visual
+    # separation.
     rng = np.random.default_rng(0)
-    for group_label, current_group in group_items:
-        color = group_color(group_label, current_group)
-        for outcome, filled in (("Success", True), ("Failed", False)):
-            sub = count_df[
-                (count_df["Contact_Group"] == group_label)
-                & (count_df["Outcome"] == outcome)
-            ]
-            if sub.empty:
-                continue
-            x_values = (
-                sub["Valid_SC_Count"].to_numpy(dtype=float)
-                + offsets[group_label]
-                + rng.uniform(-jitter, jitter, size=len(sub))
-            )
-            ax.scatter(
-                x_values,
-                sub["Landing_Latency_s"],
-                s=point_size,
-                marker="o",
-                facecolors=color if filled else "none",
-                edgecolors=color,
-                linewidths=0.8,
-                alpha=alpha,
-                label=f"{group_label} {outcome}",
-            )
-
-    # Show each group's success threshold as a horizontal reference line.
-    for _, current_group in group_items:
-        ax.axhline(current_group.latency_threshold, color="0.35", linestyle="--", linewidth=0.8, alpha=0.45)
-    ax.set_xlabel("# valid leg contact events per trial")
-    ax.set_ylabel("Landing latency (s)")
-    ax.set_xticks(range(len(legs) + 1))
-    ax.set_xlim(-0.5, len(legs) + 0.5)
-    ax.set_title("Valid leg contact count vs landing latency")
-
-    # Use separate legends for contact group colors and filled/hollow outcome
-    # encoding.
-    group_handles = [
-        plt.Line2D(
-            [0],
-            [0],
+    for outcome in ("Success", "Failed"):
+        sub = count_df[count_df["Outcome"] == outcome]
+        if sub.empty:
+            continue
+        color = colors.get(outcome, "0.35")
+        x_values = (
+            sub["Valid_SC_Count"].to_numpy(dtype=float)
+            + rng.uniform(-jitter, jitter, size=len(sub))
+        )
+        ax.scatter(
+            x_values,
+            sub["Landing_Latency_s"],
+            s=point_size,
             marker="o",
-            linestyle="none",
-            markerfacecolor=group_color(label, group),
-            markeredgecolor=group_color(label, group),
+            facecolors=color,
+            edgecolors=color,
+            linewidths=0.8,
+            alpha=alpha,
+            label=outcome,
+        )
+    # Show unique success thresholds as horizontal reference lines.
+    threshold_rows = []
+    for group_label, current_group in group_items:
+        threshold_rows.append((group_label, current_group.latency_threshold))
+    unique_thresholds = {}
+    for group_label, latency_threshold in threshold_rows:
+        unique_thresholds.setdefault(latency_threshold, []).append(group_label)
+    for latency_threshold, labels in unique_thresholds.items():
+        label = "Success threshold" if len(unique_thresholds) == 1 else f"{'/'.join(labels)} threshold"
+        ax.axhline(
+            latency_threshold,
+            color="0.35",
+            linestyle="--",
+            linewidth=0.8,
+            alpha=0.45,
             label=label,
         )
-        for label, group in group_items
-    ]
-    outcome_handles = [
-        plt.Line2D([0], [0], marker="o", linestyle="none", color="0.25", markerfacecolor="0.25", label="Success"),
-        plt.Line2D([0], [0], marker="o", linestyle="none", color="0.25", markerfacecolor="none", label="Failed"),
-    ]
-    legend1 = ax.legend(
-        handles=group_handles,
-        frameon=False,
-        title="Contact group",
-        loc="center left",
-        bbox_to_anchor=(1.0, 0.62)
-    )
-    ax.add_artist(legend1)
-    ax.legend(
-        handles=outcome_handles,
-        frameon=False,
-        title="Outcome",
-        loc="center left",
-        bbox_to_anchor=(1.0, 0.28)
-    )
+
+    ax.set_xlabel("# valid leg contact events per trial")
+    ax.set_ylabel("Landing latency (s)")
+    max_slc_count = 5
+    ax.set_xticks(range(max_slc_count + 1))
+    ax.set_xlim(-0.5, max_slc_count + 0.5)
+    ax.set_title("Valid leg contact count vs landing latency")
+
+    ax.legend(frameon=False, title="Outcome", loc="upper right")
     sns.despine()
-    plt.tight_layout(rect=[0, 0, 0.82, 1])
+    plt.tight_layout()
     if file_name is not None:
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()

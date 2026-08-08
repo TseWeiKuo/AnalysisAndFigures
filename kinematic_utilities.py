@@ -29,16 +29,6 @@ class SimpleCalculation:
     """
 
     # ------------------------------------------------------------
-    # Basic statistics
-    # ------------------------------------------------------------
-
-    def calculate_mean_diff(self, data1, data2):
-        return np.mean(data1) - np.mean(data2)
-
-    def calculate_median_diff(self, data1, data2):
-        return np.median(data1) - np.median(data2)
-
-    # ------------------------------------------------------------
     # Smoothing / normalization
     # ------------------------------------------------------------
 
@@ -112,15 +102,6 @@ class SimpleCalculation:
         angle_deg = np.degrees(angle_rad)
 
         return angle_deg
-
-    # ------------------------------------------------------------
-    # Trial data helpers
-    # ------------------------------------------------------------
-
-    def TransposeData(self, df):
-        df = pd.DataFrame(df)
-        df = df.T
-        return df
 
     def ReadAndTranspose(self, point, kinematic_data):
         """
@@ -289,6 +270,26 @@ class SimpleCalculation:
                 )
         return values
 
+    def smooth_trace_ema(self, values, alpha=0.4):
+        """Smooth finite contiguous trace segments with exponential moving average."""
+        values = np.asarray(values, dtype=float).copy()
+        finite = np.isfinite(values)
+        n = len(values)
+        i = 0
+        while i < n:
+            if not finite[i]:
+                i += 1
+                continue
+            start = i
+            while i < n and finite[i]:
+                i += 1
+            stop = i
+            values[start:stop] = np.asarray(
+                self.exponential_moving_average(values[start:stop], alpha),
+                dtype=float,
+            )
+        return values
+
     def apply_angle_tracking_qc(
             self,
             trial_info,
@@ -304,8 +305,10 @@ class SimpleCalculation:
             start_frame=None,
             end_frame=None,
             smooth=False,
+            smooth_method="savgol",
             smooth_window_frames=5,
-            smooth_polyorder=2
+            smooth_polyorder=2,
+            smooth_alpha=0.4
     ):
         """
         Apply tracking QC to one angle trace.
@@ -332,11 +335,17 @@ class SimpleCalculation:
             max_gap_frames=max_interp_gap_frames
         )
         if smooth:
-            interpolated = self.smooth_trace(
-                interpolated,
-                window_frames=smooth_window_frames,
-                polyorder=smooth_polyorder
-            )
+            if smooth_method == "ema":
+                interpolated = self.smooth_trace_ema(
+                    interpolated,
+                    alpha=smooth_alpha,
+                )
+            else:
+                interpolated = self.smooth_trace(
+                    interpolated,
+                    window_frames=smooth_window_frames,
+                    polyorder=smooth_polyorder
+                )
 
         summary = tqc.summarize_invalid_mask(
             invalid_mask,
@@ -352,20 +361,11 @@ class SimpleCalculation:
             "Score_Min": score_min,
             "Require_Score": bool(require_score),
             "Smooth_Angle": bool(smooth),
+            "Smooth_Method": smooth_method if smooth else "",
             "Smooth_Window_Frames": smooth_window_frames,
+            "Smooth_Alpha": smooth_alpha if smooth else np.nan,
         })
         return interpolated, ~invalid_mask, summary, point_summary
-
-    def interpolate_short_xyz_gaps(self, xyz, max_gap_frames=4):
-        xyz = np.asarray(xyz, dtype=float).copy()
-        interpolated_total = 0
-        for dim in range(xyz.shape[1]):
-            xyz[:, dim], count = self.interpolate_short_nan_gaps(
-                xyz[:, dim],
-                max_gap_frames=max_gap_frames
-            )
-            interpolated_total += count
-        return xyz, interpolated_total
 
     def apply_xyz_tracking_qc(
             self,
@@ -444,39 +444,6 @@ class SimpleCalculation:
         }])
         return filtered, ~invalid_mask, summary, point_summary
 
-    # ------------------------------------------------------------
-    # Segment / angle calculations from Trial object
-    # ------------------------------------------------------------
-
-    def Calculate_segment_length(self, trial_info, skeletons):
-        """
-        Calculate length of specified segments for each frame.
-
-        trial_info should be a Trial object from the new kinematic_object.
-        skeletons example:
-            [["L-fFT", "L-fTT"], ["L-fTT", "L-fLT"]]
-        """
-        collected_seg_length_data = dict()
-
-        for seg in skeletons:
-            seg_name = f"{seg[0]}_{seg[1]}"
-
-            if seg_name not in collected_seg_length_data:
-                collected_seg_length_data[seg_name] = []
-
-            for f in range(trial_info.total_frames_number):
-                length = self.Calculate_distance_between_points(
-                    x=trial_info.trial_data[seg[0]].x_coord[f],
-                    y=trial_info.trial_data[seg[0]].y_coord[f],
-                    z=trial_info.trial_data[seg[0]].z_coord[f],
-                    x1=trial_info.trial_data[seg[1]].x_coord[f],
-                    y1=trial_info.trial_data[seg[1]].y_coord[f],
-                    z1=trial_info.trial_data[seg[1]].z_coord[f]
-                )
-                collected_seg_length_data[seg_name].append(length)
-
-        return collected_seg_length_data
-
     def Calculate_joint_angle(
             self,
             trial_info,
@@ -490,8 +457,10 @@ class SimpleCalculation:
             score_min=0.8,
             require_score=False,
             smooth_angle=False,
+            smooth_method="savgol",
             smooth_window_frames=5,
             smooth_polyorder=2,
+            smooth_alpha=0.4,
             qc_start=None,
             qc_end=None,
             return_qc=False
@@ -525,8 +494,10 @@ class SimpleCalculation:
                         start_frame=qc_start,
                         end_frame=qc_end,
                         smooth=smooth_angle,
+                        smooth_method=smooth_method,
                         smooth_window_frames=smooth_window_frames,
-                        smooth_polyorder=smooth_polyorder
+                        smooth_polyorder=smooth_polyorder,
+                        smooth_alpha=smooth_alpha,
                     )
                     collected_angle_data[joint_name] = filtered_trace
                     qc_summary.update({
@@ -567,8 +538,10 @@ class SimpleCalculation:
                         start_frame=qc_start,
                         end_frame=qc_end,
                         smooth=smooth_angle,
+                        smooth_method=smooth_method,
                         smooth_window_frames=smooth_window_frames,
-                        smooth_polyorder=smooth_polyorder
+                        smooth_polyorder=smooth_polyorder,
+                        smooth_alpha=smooth_alpha,
                     )
                     collected_angle_data[joint_name] = filtered_trace
                     qc_summary.update({
@@ -742,24 +715,6 @@ class SimpleCalculation:
 
         return line_points, plane_points, verts, cylinder_top, cylinder_bottom, direction, perp_vector1, perp_vector2
 
-    # ------------------------------------------------------------
-    # Bootstrap / interpolation / threshold helpers
-    # ------------------------------------------------------------
-
-    def Bootstrapping_test(self, data1, data2, n_samps):
-        original_mean_diff = self.calculate_mean_diff(data1, data2)
-        bootstrap_mean_diffs = []
-
-        resample_data = np.concatenate((data1, data2))
-
-        for i in range(n_samps):
-            bootstrap_sample1 = resample(resample_data, n_samples=len(data1))
-            bootstrap_sample2 = resample(resample_data, n_samples=len(data2))
-            bootstrap_mean_diff = self.calculate_mean_diff(bootstrap_sample1, bootstrap_sample2)
-            bootstrap_mean_diffs.append(bootstrap_mean_diff)
-
-        Mean_diff_p_value = np.sum(np.abs(bootstrap_mean_diffs) >= np.abs(original_mean_diff)) / n_samps
-        return Mean_diff_p_value
 
     def Normalized_time(self, data, length=250):
         from scipy.interpolate import interp1d
@@ -771,48 +726,6 @@ class SimpleCalculation:
 
         return signal
 
-    def get_ag_vel_thresh(self, ag, on_set_window=4):
-        vel_threshold = None
-        min_change_threshold = None
-
-        ag = np.asarray(ag, dtype=float)
-        dag = np.gradient(ag)
-        positive_idx = np.where(dag > 0)[0]
-
-        if len(positive_idx) == 0:
-            return np.nan, np.nan
-
-        onset = positive_idx[0]
-
-        if onset + on_set_window >= len(dag):
-            vel_threshold = np.nanmean(dag[onset:])
-            min_change_threshold = ag[-1] - ag[onset]
-        else:
-            vel_threshold = np.mean(dag[onset:onset + on_set_window])
-            min_change_threshold = ag[onset + on_set_window] - ag[onset]
-
-        return vel_threshold, min_change_threshold
-    def get_angle_data_fn(self, trial_info, leg_name):
-        """
-        Example stub.
-        trial_index might be (fly_num, trial_num)
-        leg_name might be 'L-f', 'L-m', 'L-h'
-        """
-        angs = [[f"{leg_name}BC", f"{leg_name}CT", f"{leg_name}FT"],
-                [f"{leg_name}CT", f"{leg_name}FT", f"{leg_name}TT"]]
-        angle_data = self.Calculate_joint_angle(trial_info, angs)
-        return angle_data[f"{leg_name}FT"], angle_data[f"{leg_name}CT"]
-
-    def get_ct_start_threshold(self, ct):
-        ct = np.asarray(ct, dtype=float)
-        dct = np.gradient(ct)
-        positive_idx = np.where(dct > 0)[0]
-
-        if len(positive_idx) == 0:
-            return np.nan
-
-        onset = positive_idx[0]
-        return np.mean(ct[:onset])
 
     def calculate_wing_angle_trace(self, trial_info:Trial):
         """
@@ -1098,10 +1011,8 @@ class SimpleCalculation:
 # ------------------------------------------------------------
 
 class DetectCharacteristics:
-    def __init__(self, radius=0, FPS=0):
-        self.radius = radius
+    def __init__(self):
         self.calculator = SimpleCalculation()
-        self.fps = FPS
 
     def ReadCoordsAll(self, kinematic_data, fnum):
         """
@@ -1234,79 +1145,6 @@ class DetectCharacteristics:
         return -1
 
 
-# ------------------------------------------------------------
-# File / Excel helpers
-# ------------------------------------------------------------
-
-class FileManipulation:
-    """
-    Keep file I/O helpers here.
-    """
-
-    def highlight_excel_cells(self, excel_path, sheet_name, rows, cols, fill_color="FFFF00"):
-        wb = load_workbook(excel_path)
-        ws = wb[sheet_name]
-        fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
-
-        for row, col in zip(rows, cols):
-            ws.cell(row=row, column=col).fill = fill
-
-        wb.save(excel_path)
-
-    def save_dataframe(self, df, path):
-        df.to_csv(path, index=False)
-
-    # Extract the data path of the csv files and organize them in the order by fly number
-    def read_secondary_contact_data(self, data, legs, filepath=None):
-        if filepath is not None:
-            data_to_read = pd.read_csv(filepath)
-        else:
-            data_to_read = data
-        successful_landing_data = dict()
-        failed_landing_data = dict()
-        jointA = "FT"
-        jointB = "TT"
-        for row in data_to_read.iterrows():
-            for l in legs:
-                if l not in successful_landing_data.keys() and l not in failed_landing_data.keys():
-                    successful_landing_data[l] = []
-                    failed_landing_data[l] = []
-
-                if row[1][l + jointA] > 0 and int(row[1][l + jointA]) != 10000:
-
-                    if row[1]["Result"] != "Failed":
-                        successful_landing_data[l].append(row[1][l + jointA])
-                    else:
-                        failed_landing_data[l].append(row[1][l + jointA])
-                elif row[1][l + jointB] > 0 and int(row[1][l + jointB]) != 10000:
-
-                    if row[1]["Result"] != "Failed":
-                        successful_landing_data[l].append(row[1][l + jointB])
-                    else:
-                        failed_landing_data[l].append(row[1][l + jointB])
-                else:
-
-                    if row[1]["Result"] != "Failed":
-                        successful_landing_data[l].append(np.nan)
-                    else:
-                        failed_landing_data[l].append(np.nan)
-        successful_landing_data = pd.DataFrame(successful_landing_data)
-        failed_landing_data = pd.DataFrame(failed_landing_data)
-        return successful_landing_data, failed_landing_data
-
-    def read_leg_search_data(self, data, legs, filepath=None):
-        if filepath is not None:
-            data_to_read = pd.read_csv(filepath)
-        else:
-            data_to_read = data
-        failed_landing = data_to_read[data_to_read["Result"] == "Failed"]
-        failed_landing = failed_landing[legs]
-
-        successful_landing = data_to_read[data_to_read["Result"] == "Success"]
-        successful_landing = successful_landing[legs]
-
-        return successful_landing, failed_landing
-
 
 # ------------------------------------------------------------
 # Group-level analysis helpers
@@ -1321,13 +1159,9 @@ class GroupDataAnalyzer:
     to manually inspect and migrate them one by one.
     """
 
-    def __init__(self, platform_offset=0, radius=0, FPS=0):
-        self.platform_offset = platform_offset
-        self.radius = radius
-        self.fps = FPS
+    def __init__(self):
         self.calculator = SimpleCalculation()
-        self.manipulator = FileManipulation()
-        self.detector = DetectCharacteristics(radius=radius, FPS=FPS)
+        self.detector = DetectCharacteristics()
 
 
     # ------------------------------------------------------------
@@ -1372,9 +1206,14 @@ class GroupDataAnalyzer:
             min_cameras=2,
             max_interp_gap_frames=5,
             min_valid_fraction=0.7,
+            error_max=50,
+            score_min=0.8,
+            require_score=False,
             smooth_angle=False,
+            smooth_method="savgol",
             smooth_window_frames=5,
             smooth_polyorder=2,
+            smooth_alpha=0.4,
             qc_start=None,
             qc_end=None,
             return_qc=False
@@ -1423,9 +1262,14 @@ class GroupDataAnalyzer:
                 min_cameras=min_cameras,
                 max_interp_gap_frames=max_interp_gap_frames,
                 min_valid_fraction=min_valid_fraction,
+                error_max=error_max,
+                score_min=score_min,
+                require_score=require_score,
                 smooth_angle=smooth_angle,
+                smooth_method=smooth_method,
                 smooth_window_frames=smooth_window_frames,
                 smooth_polyorder=smooth_polyorder,
+                smooth_alpha=smooth_alpha,
                 return_qc=apply_tracking_qc
             )
             if apply_tracking_qc:
@@ -1508,881 +1352,4 @@ class GroupDataAnalyzer:
             return collected_data, pd.DataFrame(qc_rows), pd.DataFrame(skipped_rows)
         return collected_data
 
-    # ------------------------------------------------------------
-    # Secondary contact
-    # ------------------------------------------------------------
-
-    def AnalyzeSecondaryContact(self, index_to_iterate, group_info, threshold, radius, analysis_window=0.71, condition=""):
-        """
-        Analyze secondary contact timing for each segment.
-
-        Output dataframe is preprocessed into:
-            SC, Index, Result
-
-        SC = minimum value among columns containing:
-            L-f, L-m, L-h
-
-        If all those values are 10000, SC is set to NaN.
-        """
-        if index_to_iterate is None or len(index_to_iterate) == 0:
-            return pd.DataFrame(columns=["SC", "Index", "Result"])
-
-        self._ensure_trials_loaded(group_info, trial_types=["Landing", "Flying"])
-
-        segs = [
-            ["L-fFT", "L-fTT"], ["L-fTT", "L-fLT"],
-            ["L-mFT", "L-mTT"], ["L-mTT", "L-mLT"],
-            ["L-hFT", "L-hTT"], ["L-hTT", "L-hLT"]
-        ]
-        ra = [0.45, 0.4, 0.5, 0.4, 0.55, 0.4]
-        pts = [
-            "L-fFT", "L-fTT", "L-fLT",
-            "L-mFT", "L-mTT", "L-mLT",
-            "L-hFT", "L-hTT", "L-hLT"
-        ]
-        indi_leg_contact_event = dict()
-        for j in segs:
-            indi_leg_contact_event[j[0]] = []
-
-        indi_leg_contact_event["Index"] = []
-        indi_leg_contact_event["Result"] = []
-
-        for index in index_to_iterate:
-            pose_data = self._get_trial_obj(group_info, index)
-
-            start = int(pose_data.moc)
-            end = int(pose_data.mol)
-
-            if start > 0:
-                if end == -1:
-                    end = start + int(analysis_window * pose_data.fps)
-                    indi_leg_contact_event["Result"].append("Failed")
-                elif (end - start) / pose_data.fps > threshold:
-                    if analysis_window == threshold:
-                        end = start + int(threshold * pose_data.fps)
-                    indi_leg_contact_event["Result"].append("Failed")
-                elif (end - start) / pose_data.fps <= threshold:
-                    indi_leg_contact_event["Result"].append("Success")
-                else:
-                    print("Unable to categorize!")
-
-            line_points, plane_points, verts, cylinder_top, cylinder_bottom, direction, perp_vector1, perp_vector2 = (
-                self.calculator.calculate_platform_surfaces(
-                    trial_info=pose_data,
-                    platform_offset=0.03,
-                    platform_height=3,
-                    radius=radius
-                )
-            )
-
-            Original_points = dict()
-            center_points = self.calculator.ReadAndTranspose("platform-tip", pose_data)[start:end]
-
-            for p in pts:
-                Original_points[p] = self.calculator.ReadAndTranspose(p, pose_data)[start:end]
-
-            for s, point in enumerate(segs):
-                NoContact = True
-                stable_contact = 0
-
-                for current_frame in range(end - start):
-                    A = Original_points[point[0]][current_frame]
-                    B = Original_points[point[1]][current_frame]
-                    P1 = center_points[current_frame]
-
-                    d = direction
-                    r = radius
-                    h = 3
-
-                    intersects_side, pt_side, min_dist = self.calculator.check_cylinder_side_intersection(
-                        A, B, P1, d, r, h
-                    )
-                    intersects_top, pt_top = self.detector.check_leg_platform_intersection(
-                        A, B, d, P1, 0.03, r
-                    )
-
-                    if intersects_side or intersects_top:
-                        stable_contact += 1
-                    else:
-                        stable_contact = 0
-
-                    if stable_contact >= 2:
-                        indi_leg_contact_event[point[0]].append(current_frame / pose_data.fps)
-                        NoContact = False
-                        break
-
-                if NoContact:
-                    indi_leg_contact_event[point[0]].append(10000)
-
-            if index not in indi_leg_contact_event["Index"]:
-                indi_leg_contact_event["Index"].append(index)
-
-        # ------------------------------------------------------------
-        # preprocess before saving
-        # ------------------------------------------------------------
-        indi_leg_contact_event = pd.DataFrame(indi_leg_contact_event)
-
-        # only use left leg columns for SC
-        sc_cols = [col for col in indi_leg_contact_event.columns
-                   if ("L-f" in col or "L-m" in col or "L-h" in col)]
-
-        sc_df = indi_leg_contact_event[sc_cols].copy()
-
-        # replace dummy code with NaN before taking minimum
-        sc_df = sc_df.replace(10000, np.nan)
-
-        processed_df = pd.DataFrame()
-        processed_df["SC"] = sc_df.min(axis=1)
-        processed_df["Index"] = indi_leg_contact_event["Index"]
-        processed_df["Result"] = indi_leg_contact_event["Result"]
-
-        if condition == "":
-            indi_leg_contact_event.to_csv(f"{group_info.group_name}-{threshold}-SC_data.csv", index=False)
-            return indi_leg_contact_event
-        processed_df.to_csv(f"{group_info.group_name}-{condition}-{threshold}-SC_data.csv", index=False)
-        return processed_df
-
-    # ------------------------------------------------------------
-    # Contact leg metrics
-    # ------------------------------------------------------------
-
-    def Calculate_contact_leg_metrices(self, group_info, index_to_iterate, joint_angle, threshold=0.71):
-        """
-        Compare average angular velocity between success and failed trials.
-        """
-        if index_to_iterate is None or len(index_to_iterate) == 0:
-            return [], []
-
-        self._ensure_trials_loaded(group_info, trial_types=["Landing", "Flying"])
-
-        joint_to_examine = joint_angle[0][1]
-        failed_ang_v = []
-        failed_posture = []
-        success_ang_v = []
-        success_posture = []
-        for index in index_to_iterate:
-            trial_info = self._get_trial_obj(group_info, index)
-            start = trial_info.moc
-
-            if start > 0:
-                angs = self.calculator.Calculate_joint_angle(trial_info, joint_angle)
-                Failed = False
-
-                analysis_start = trial_info.moc
-
-                if trial_info.mol < 0 or (trial_info.mol > 0 and ((trial_info.mol - trial_info.moc) / trial_info.fps) > threshold):
-                    Failed = True
-
-                ang_v = np.mean(np.gradient(angs[joint_to_examine][analysis_start:int(analysis_start + 0.1 * trial_info.fps)])) * trial_info.fps
-                posture = np.mean(angs[joint_to_examine][:analysis_start])
-                if Failed:
-                    failed_ang_v.append(ang_v)
-                    failed_posture.append(posture)
-                else:
-                    success_ang_v.append(ang_v)
-                    success_posture.append(posture)
-
-        return success_ang_v, success_posture, failed_ang_v, failed_posture
-
-    # ------------------------------------------------------------
-    # Leg search
-    # ------------------------------------------------------------
-
-    def Analyze_leg_search(self, group_info, index_to_iterate=None, condition="", threshold=0.71, analysis_window=0.71):
-        print(threshold)
-        """
-        Analyze leg search counts.
-
-        Default behavior:
-        - if no index_to_iterate is passed, use Landing trials from Group metadata
-        """
-        self._ensure_trials_loaded(group_info, trial_types=["Landing", "Flying"])
-        Angles = [
-            [["L-fBC", "L-fCT", "L-fFT"], ["L-fCT", "L-fFT", "L-fTT"]],
-            [["L-mBC", "L-mCT", "L-mFT"], ["L-mCT", "L-mFT", "L-mTT"]],
-            [["L-hBC", "L-hCT", "L-hFT"], ["L-hCT", "L-hFT", "L-hTT"]],
-            [["R-fBC", "R-fCT", "R-fFT"], ["R-fCT", "R-fFT", "R-fTT"]],
-            [["R-mBC", "R-mCT", "R-mFT"], ["R-mCT", "R-mFT", "R-mTT"]],
-            [["R-hBC", "R-hCT", "R-hFT"], ["R-hCT", "R-hFT", "R-hTT"]]
-        ]
-
-        leg_search_data = dict()
-        leg_search_data["L-f"] = []
-        leg_search_data["L-m"] = []
-        leg_search_data["L-h"] = []
-        leg_search_data["R-f"] = []
-        leg_search_data["R-m"] = []
-        leg_search_data["R-h"] = []
-        leg_search_data["Index"] = []
-        leg_search_data["Result"] = []
-
-        if index_to_iterate is None:
-            self._ensure_metadata_ready(group_info)
-            index_to_iterate = group_info.get_targeted_trials(["Landing"])
-
-        for index in index_to_iterate:
-            trial_info = self._get_trial_obj(group_info, index)
-            start = trial_info.moc
-            end = trial_info.mol
-            leg_search_data["Index"].append(index)
-
-            if end == -1:
-                end = start + int(analysis_window * trial_info.fps)
-                leg_search_data["Result"].append("Failed")
-            elif (end - start) / trial_info.fps > threshold:
-                if analysis_window == threshold:
-                    end = start + int(threshold * trial_info.fps)
-                leg_search_data["Result"].append("Failed")
-            elif (end - start) / trial_info.fps <= threshold:
-                leg_search_data["Result"].append("Success")
-            else:
-                print("Unable to categorize!")
-
-            for pair in Angles:
-                ags = self.calculator.Calculate_joint_angle(trial_info, pair)
-
-                ct_trace = None
-                ft_trace = None
-
-                for ag in pair:
-                    trace = np.array(ags[ag[1]][start:end + 1])
-                    if len(ags[ag[1]]) == 1400:
-                        trace = self.calculator.Normalized_time(trace, int(1.25 * len(trace)))
-                    if "CT" in ag[1]:
-                        ct_trace = trace
-                    if "FT" in ag[1]:
-                        ft_trace = trace
-
-                if "f" in pair[0][0][:3]:
-                    """counts, events = self.detector.detect_leg_search(
-                        ft=ft_trace,
-                        ct=ct_trace,
-                        ft_vel_thresh=1.07,
-                        ct_vel_thresh=0.295,
-                        min_ft_change=6,
-                        min_ct_change=1,
-                        pattern_duration=20,
-                        ct_start_thresh=32
-                    )"""
-                    peaks, _ = find_peaks(ct_trace, height=86.939, prominence=19.609)
-                    leg_search_data[pair[0][0][:3]].append(len(peaks))
-
-                elif "m" in pair[0][0][:3]:
-                    """counts, events = self.detector.detect_leg_search(
-                        ft=ft_trace,
-                        ct=ct_trace,
-                        ft_vel_thresh=1.94,
-                        ct_vel_thresh=0.8,
-                        min_ft_change=9,
-                        min_ct_change=3,
-                        pattern_duration=19,
-                        ct_start_thresh=60
-                    )"""
-                    peaks, _ = find_peaks(ct_trace, height=84.355, prominence=15.267)
-                    leg_search_data[pair[0][0][:3]].append(len(peaks))
-                else:
-                    # peaks, _ = find_peaks(ct_trace, height=95.878, prominence=10.697)
-                    peaks, _ = find_peaks(ct_trace, height=105.215, prominence=7.418)
-                    leg_search_data[pair[0][0][:3]].append(len(peaks))
-
-
-        ls_cols = ["L-f", "L-m", "L-h"]
-        leg_search_data = pd.DataFrame(leg_search_data)
-
-        leg_search_data["LS_sum"] = leg_search_data[ls_cols].sum(axis=1)
-        leg_search_data = leg_search_data[["LS_sum", "Index", "Result"]].copy()
-        if condition == "":
-            leg_search_data.to_csv(f"{group_info.group_name}-{threshold}-LS_data.csv", index=False)
-            return leg_search_data
-        leg_search_data.to_csv(f"{group_info.group_name}-{condition}-{threshold}-LS_data.csv", index=False)
-        return leg_search_data
-
-
-    def Analyze_leg_search_CHR(self, group_info, index_to_iterate=None, filename="", threshold=0.71):
-        """
-        Analyze leg search counts for Chr data.
-        """
-        self._ensure_trials_loaded(group_info, trial_types=["Landing", "Flying", "NF", "NA"])
-
-        Angles = [
-            [["L-fBC", "L-fCT", "L-fFT"], ["L-fCT", "L-fFT", "L-fTT"]],
-            [["L-mBC", "L-mCT", "L-mFT"], ["L-mCT", "L-mFT", "L-mTT"]],
-            [["L-hBC", "L-hCT", "L-hFT"], ["L-hCT", "L-hFT", "L-hTT"]],
-            [["R-fBC", "R-fCT", "R-fFT"], ["R-fCT", "R-fFT", "R-fTT"]],
-            [["R-mBC", "R-mCT", "R-mFT"], ["R-mCT", "R-mFT", "R-mTT"]],
-            [["R-hBC", "R-hCT", "R-hFT"], ["R-hCT", "R-hFT", "R-hTT"]]
-        ]
-
-        leg_search_data = dict()
-        leg_search_data["L-f"] = []
-        leg_search_data["L-m"] = []
-        leg_search_data["L-h"] = []
-        leg_search_data["R-f"] = []
-        leg_search_data["R-m"] = []
-        leg_search_data["R-h"] = []
-        leg_search_data["Index"] = []
-        leg_search_data["Result"] = []
-
-        if index_to_iterate is None:
-            self._ensure_metadata_ready(group_info)
-            index_to_iterate = group_info.get_targeted_trials(["Landing"])
-
-        for index in index_to_iterate:
-            trial_info = self._get_trial_obj(group_info, index)
-            angs = self.calculator.Calculate_joint_angle(trial_info, [["L-wing", "L-wing-hinge", "R-wing"]])
-
-            start = 750
-            end = self.detector.detect_landing(angs["L-wing-hinge"][750:1250]) + start
-
-            plt.plot(angs["L-wing-hinge"][750:1250])
-
-            if end == 749:
-                end = 1250
-
-            leg_search_data["Index"].append(index)
-
-            if end == 1250:
-                end = start + int(threshold * trial_info.fps)
-                leg_search_data["Result"].append("Failed")
-            elif (end - start) / trial_info.fps > threshold:
-                end = start + int(threshold * trial_info.fps)
-                leg_search_data["Result"].append("Failed")
-            elif (end - start) / trial_info.fps <= threshold:
-                leg_search_data["Result"].append("Success")
-            else:
-                print("Unable to categorize!")
-
-            print(index, end)
-
-            for pair in Angles:
-                ags = self.calculator.Calculate_joint_angle(trial_info, pair)
-
-                ct_trace = None
-                ft_trace = None
-
-                for ag in pair:
-                    trace = np.array(ags[ag[1]][start:end + 1])
-
-                    if "CT" in ag[1]:
-                        ct_trace = trace
-                    if "FT" in ag[1]:
-                        ft_trace = trace
-
-                if "h" not in pair[0][0][:3]:
-                    counts, events = self.detector.detect_leg_search(ft_trace, ct_trace)
-                    leg_search_data[pair[0][0][:3]].append(counts)
-                else:
-                    peaks, _ = find_peaks(ct_trace, prominence=15)
-                    leg_search_data[pair[0][0][:3]].append(len(peaks))
-
-        leg_search_data = pd.DataFrame(leg_search_data)
-        leg_search_data.to_csv(f"{group_info.group_name}-{filename}-LS_data_.csv", index=False)
-
-        return leg_search_data
-
-    def _build_leg_search_path(self, group_info, threshold, condition=""):
-        if condition == "":
-            return f"{group_info.group_name}-{threshold}-LS_data.csv"
-        return f"{group_info.group_name}-{condition}-{threshold}-LS_data.csv"
-
-    def _build_secondary_contact_path(self, group_info, threshold, condition=""):
-        if condition == "":
-            return f"{group_info.group_name}-{threshold}-SC_data.csv"
-        return f"{group_info.group_name}-{condition}-{threshold}-SC_data.csv"
-
-    def get_or_run_leg_search(self, group_info, index_to_iterate=None, filename="", threshold=0.71, analysis_window=0.71,
-                              force_recompute=False):
-        """
-        Load saved leg search data if it already exists.
-        Otherwise run Analyze_leg_search and save it.
-
-        Returns:
-            DataFrame with columns like:
-            LS_sum, Index, Result
-        """
-        save_path = self._build_leg_search_path(group_info, threshold, filename)
-        if (not force_recompute) and os.path.exists(save_path):
-            print(f"Using existing leg search data: {save_path}")
-            return pd.read_csv(save_path)
-
-        print(f"Running leg search analysis: {save_path}")
-        return self.Analyze_leg_search(
-            group_info=group_info,
-            index_to_iterate=index_to_iterate,
-            analysis_window=analysis_window,
-            condition=filename,
-            threshold=threshold
-        )
-
-    def get_or_run_secondary_contact(self, group_info, index_to_iterate=None, radius=0.4, threshold=0.71, filename="", analysis_window=0.71,
-                                     force_recompute=False):
-        """
-        Load saved secondary contact data if it already exists.
-        Otherwise run AnalyzeSecondaryContact and save it.
-
-        Returns:
-            DataFrame with columns:
-            SC, Index, Result
-        """
-        save_path = self._build_secondary_contact_path(group_info, threshold, filename)
-
-        if (not force_recompute) and os.path.exists(save_path):
-            print(f"Using existing secondary contact data: {save_path}")
-            return pd.read_csv(save_path)
-
-        print(f"Running secondary contact analysis: {save_path}")
-        return self.AnalyzeSecondaryContact(
-            index_to_iterate=index_to_iterate,
-            group_info=group_info,
-            threshold=threshold,
-            condition=filename,
-            analysis_window=analysis_window,
-            radius=radius
-        )
-
-    def get_secondary_contact_kmc_df(self, group_info,
-                                     index_to_iterate=None,
-                                     radius=0.4,
-                                     threshold=0.71,
-                                     filename="",
-                                     analysis_window=0.71,
-                                     force_recompute=False):
-        """
-        Return a KMC-ready dataframe for secondary contact.
-
-        It will:
-        - load saved SC analysis if available
-        - otherwise run SC analysis
-        - convert SC / Index / Result into latency / event format
-        """
-        if index_to_iterate is None:
-            if len(group_info.trial_metadata) == 0:
-                group_info.initialize_manual_data()
-                group_info.filter_nan_fly()
-
-            index_to_iterate = group_info.get_targeted_trials(["Landing", "Flying"])
-
-        sc_df = self.get_or_run_secondary_contact(
-            group_info=group_info,
-            index_to_iterate=index_to_iterate,
-            radius=radius,
-            threshold=threshold,
-            filename=filename,
-            analysis_window=analysis_window,
-            force_recompute=force_recompute
-        )
-
-        if sc_df is None or len(sc_df) == 0:
-            return pd.DataFrame(columns=["SC", "Index", "Result", "Latency", "Event", "Group_Name"])
-
-        kmc_df = sc_df.copy()
-        kmc_df["Event"] = kmc_df["SC"].notna().astype(int)
-        kmc_df["Latency"] = kmc_df["SC"].fillna(threshold)
-        kmc_df["Group_Name"] = group_info.group_name
-
-        return kmc_df
-
-    def extract_leg_search_parameters(self, group_info:Group, label_df, leg_columns=("L-f", "L-m", "L-h"), smooth_window=1, margin=0):
-        """
-        Extract parameter values from labeled search bouts.
-
-        Parameters
-        ----------
-        label_df : pd.DataFrame
-            Must contain:
-                - 'Index' column with trial identifier
-                - leg columns storing (start, stop) tuples
-        get_angle_data_fn : callable
-            Function with signature:
-                ft, ct = get_angle_data_fn(trial_index, leg_name)
-            where:
-                trial_index is the value from label_df['Index']
-                leg_name is one of leg_columns
-            and ft, ct are 1D angle arrays.
-        leg_columns : tuple[str]
-            Label columns to parse.
-        smooth_window : int
-            Moving average window before gradient calculation.
-        margin : int
-            Optional number of frames to expand around labeled interval.
-            Useful if labels are tight and you want to capture onset context.
-
-        Returns
-        -------
-        param_df : pd.DataFrame
-            One row per labeled bout, containing extracted parameters.
-        """
-        group_info.initialize_manual_data()
-        group_info.read_kinematic_data()
-        records = []
-
-        for _, row in label_df.iterrows():
-            trial_index = self.calculator.parse_tuple_cell(row["Index"]) if isinstance(row["Index"], str) else row["Index"]
-
-            for leg in leg_columns:
-                if leg not in row:
-                    continue
-
-                bout = self.calculator.parse_tuple_cell(row[leg])
-                if bout is None:
-                    continue
-
-                start, stop = bout
-                if stop <= start:
-                    continue
-
-                trial_info = group_info.fly_kinematic_data[f"F{trial_index[0]}T{trial_index[1]}"]
-                ft, ct = self.calculator.get_angle_data_fn(trial_info, leg)
-                ft = np.asarray(ft, dtype=float)
-                ct = np.asarray(ct, dtype=float)
-
-                if len(ft) != len(ct):
-                    raise ValueError(f"FT and CT length mismatch for {trial_index}, {leg}")
-
-                # Expand interval if desired
-                s = max(0, start - margin)
-                e = min(len(ft), stop + margin)
-
-                if e - s < 2:
-                    continue
-
-                # Segment restricted to labeled bout
-                ft_seg = ft[s:e]
-                ct_seg = ct[s:e]
-
-                ft_vel_threshold, ft_min_ag_threshold = self.calculator.get_ag_vel_thresh(ft_seg)
-                ct_vel_threshold, ct_min_ag_threshold = self.calculator.get_ag_vel_thresh(ct_seg)
-                ct_start_threshold = self.calculator.get_ct_start_threshold(ct_seg)
-                bout_duration = e - s
-
-                records.append({
-                    "Index": trial_index,
-                    "Leg": leg,
-                    "LabelStart": start,
-                    "LabelStop": stop,
-                    "UsedStart": s,
-                    "UsedStop": e,
-                    "FT_vel_threshold": ft_vel_threshold,
-                    "CT_vel_threshold": ct_vel_threshold,
-                    "FT_min_change": ft_min_ag_threshold,
-                    "CT_min_change": ct_min_ag_threshold,
-                    "CT_start_threshold": ct_start_threshold,
-                    "Bout_duration": bout_duration,
-                })
-        param_df = pd.DataFrame(records)
-        return param_df
-
-    def extract_ct_peak_finder_parameters(
-            self,
-            group_info,
-            label_df,
-            leg_columns=("L-f", "L-m", "L-h"),
-            smooth_window=5,
-            margin_before=5,
-            margin_after=20,
-            loose_peak_distance=3,
-    ):
-        """
-        Extract CT extension parameters from positive labeled bouts.
-
-        Assumes each label cell stores:
-            (rise_start_frame, peak_frame)
-
-        Returns one row per labeled extension event.
-        """
-
-        group_info.initialize_manual_data()
-        group_info.read_kinematic_data()
-
-        records = []
-
-        for _, row in label_df.iterrows():
-
-            trial_index = (
-                self.calculator.parse_tuple_cell(row["Index"])
-                if isinstance(row["Index"], str)
-                else row["Index"]
-            )
-
-            for leg in leg_columns:
-
-                if leg not in row:
-                    continue
-
-                bout = self.calculator.parse_tuple_cell(row[leg])
-
-                if bout is None:
-                    continue
-
-                start, peak = bout
-                start = int(start)
-                peak = int(peak)
-
-                if peak <= start:
-                    continue
-
-                key = f"F{trial_index[0]}T{trial_index[1]}"
-
-                if key not in group_info.fly_kinematic_data:
-                    print(f"Missing trial: {key}")
-                    continue
-
-                trial_info = group_info.fly_kinematic_data[key]
-
-                ft, ct = self.calculator.get_angle_data_fn(trial_info, leg)
-                ct = np.asarray(ct, dtype=float)
-
-                if len(ct) < peak + 1:
-                    print(f"Peak frame outside trace length: {key}, {leg}")
-                    continue
-
-                # Smooth CT trace
-                ct_s = self.calculator.exponential_moving_average(ct, alpha=0.4)
-                ct_s = np.asarray(ct_s, dtype=float)
-
-                # If you prefer your old moving average instead, use:
-                # ct_s = self.moving_average(ct, smooth_window)
-
-                dct = np.gradient(ct_s)
-
-                # Main labeled interval
-                labeled_seg = ct_s[start:peak + 1]
-                labeled_vel = dct[start:peak + 1]
-
-                # Wider window around label for estimating true peak properties
-                s = max(0, start - margin_before)
-                e = min(len(ct_s), peak + margin_after + 1)
-                search_seg = ct_s[s:e]
-
-                # Loose peak detection inside label-centered window
-                candidate_peaks, _ = find_peaks(
-                    search_seg,
-                    distance=loose_peak_distance
-                )
-
-                # Convert local peak indices to global frame indices
-                candidate_peaks_global = candidate_peaks + s
-
-                # Pick the detected peak closest to your labeled peak frame
-                if len(candidate_peaks_global) > 0:
-                    closest_idx = np.argmin(np.abs(candidate_peaks_global - peak))
-                    detected_peak_global = int(candidate_peaks_global[closest_idx])
-                    detected_peak_local = int(candidate_peaks[closest_idx])
-
-                    prom = peak_prominences(search_seg, [detected_peak_local])[0][0]
-                    width = peak_widths(search_seg, [detected_peak_local], rel_height=0.5)[0][0]
-                else:
-                    detected_peak_global = peak
-                    detected_peak_local = peak - s
-
-                    # fallback: your label-based prominence proxy
-                    prom = ct_s[peak] - ct_s[start]
-                    width = np.nan
-
-                ct_start_angle = ct_s[start]
-                ct_peak_angle = ct_s[peak]
-                ct_detected_peak_angle = ct_s[detected_peak_global]
-
-                rise_amplitude = ct_peak_angle - ct_start_angle
-                abs_rise_amplitude = abs(rise_amplitude)
-
-                peak_velocity = np.nanmax(labeled_vel)
-                peak_abs_velocity = np.nanmax(np.abs(labeled_vel))
-
-                rise_duration_frames = peak - start
-                rise_duration_sec = rise_duration_frames / trial_info.fps
-
-                records.append({
-                    "Index": trial_index,
-                    "Fly": trial_index[0],
-                    "Trial": trial_index[1],
-                    "Leg": leg,
-
-                    "Rise_Start": start,
-                    "Labeled_Peak": peak,
-                    "Detected_Peak": detected_peak_global,
-                    "Peak_Frame_Error": detected_peak_global - peak,
-
-                    "CT_start_angle": ct_start_angle,
-                    "CT_labeled_peak_angle": ct_peak_angle,
-                    "CT_detected_peak_angle": ct_detected_peak_angle,
-
-                    "CT_rise_amplitude": rise_amplitude,
-                    "CT_abs_rise_amplitude": abs_rise_amplitude,
-
-                    "CT_peak_velocity": peak_velocity,
-                    "CT_peak_abs_velocity": peak_abs_velocity,
-
-                    "Rise_duration_frames": rise_duration_frames,
-                    "Rise_duration_sec": rise_duration_sec,
-
-                    "Peak_prominence": prom,
-                    "Peak_width": width,
-                })
-
-        return pd.DataFrame(records)
-
-    def extract_labeled_ct_peak_parameters(
-            self,
-            label_df,
-            group_info,
-            get_angle_data_fn,
-            smooth_window=7,
-            peak_correction_window=5,
-            target_len=1750,
-            debug_plot=False,
-    ):
-        """
-        Extract peak-finder parameters from manually labeled CT extension peaks.
-
-        label_df columns:
-            Fly, Trial, Leg, Event_ID, Peak_Frame
-
-        Notes:
-            - If trace length is 1400, it is normalized to target_len.
-            - Peak_Frame is converted into the normalized frame coordinate.
-            - Local maxima are searched within Peak_Frame ± peak_correction_window.
-        """
-
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        from scipy.signal import find_peaks, peak_prominences, peak_widths
-
-        records = []
-
-        for _, row in label_df.iterrows():
-
-            fly = int(row["Fly"])
-            trial = int(row["Trial"])
-            leg = row["Leg"]
-            event_id = int(row["Event_ID"])
-
-            labeled_peak_original = int(row["Peak_Frame"])
-            labeled_peak = labeled_peak_original
-
-            key = f"F{fly}T{trial}"
-
-            if key not in group_info.fly_kinematic_data:
-                print(f"Missing trial: {key}")
-                continue
-
-            trial_info = group_info.fly_kinematic_data[key]
-
-            ft, ct = get_angle_data_fn(trial_info, leg)
-
-            original_len = len(ct)
-            normalized = False
-
-            peak_correction_window_used = peak_correction_window
-
-            if original_len == 1400:
-                normalized = True
-
-                labeled_peak = int(round(labeled_peak_original * target_len / original_len))
-                peak_correction_window_used = int(round(peak_correction_window * target_len / original_len))
-
-                ft = self.calculator.Normalized_time(ft, target_len)
-                ct = self.calculator.Normalized_time(ct, target_len)
-
-            ct = np.asarray(ct, dtype=float)
-
-            if labeled_peak < 0 or labeled_peak >= len(ct):
-                print(
-                    f"Peak outside trace: {key}, {leg}, "
-                    f"original={labeled_peak_original}, normalized={labeled_peak}"
-                )
-                continue
-
-            # Smooth CT trace exactly as you will for detection
-            sw = smooth_window
-            if sw % 2 == 0:
-                sw += 1
-
-            if len(ct) > sw:
-                ct_s = self.calculator.exponential_moving_average(ct, alpha=0.4)
-                ct_s = np.asarray(ct_s, dtype=float)
-            else:
-                ct_s = ct.copy()
-
-            if debug_plot:
-                plt.figure(figsize=(8, 3))
-                plt.plot(ct, color="orange", alpha=0.5, label="raw / normalized CT")
-                plt.plot(ct_s, color="blue", label="smoothed CT")
-                plt.scatter(x=labeled_peak, y=ct_s[labeled_peak], color="red")
-                # plt.axvline(labeled_peak, color="black", linestyle="--", label="labeled peak")
-                plt.title(f"{key} {leg} Event {event_id}")
-                plt.legend()
-                plt.tight_layout()
-                plt.show()
-
-            # Search for real local maxima near labeled peak
-            search_left = max(0, labeled_peak - peak_correction_window_used)
-            search_right = min(len(ct_s), labeled_peak + peak_correction_window_used + 1)
-
-            search_segment = ct_s[search_left:search_right]
-
-            local_peaks, _ = find_peaks(search_segment, distance=1)
-
-            if len(local_peaks) > 0:
-                local_labeled = labeled_peak - search_left
-
-                closest_local_peak = local_peaks[np.argmin(np.abs(local_peaks - local_labeled))]
-
-                corrected_peak = search_left + int(closest_local_peak)
-                correction_status = "local_peak_found"
-
-                prominence = peak_prominences(ct_s, [corrected_peak])[0][0]
-                width = peak_widths(ct_s, [corrected_peak], rel_height=0.5)[0][0]
-
-            else:
-                corrected_peak = labeled_peak
-                correction_status = "no_local_peak_found"
-
-                prominence = np.nan
-                width = np.nan
-
-            peak_height = ct_s[corrected_peak]
-
-            records.append({
-                "Fly": fly,
-                "Trial": trial,
-                "Leg": leg,
-                "Event_ID": event_id,
-
-                "Original_Trace_Length": original_len,
-                "Normalized": normalized,
-                "Target_Length": target_len if normalized else original_len,
-
-                "Labeled_Peak_Frame_Original": labeled_peak_original,
-                "Labeled_Peak_Frame_Normalized": labeled_peak,
-                "Corrected_Peak_Frame": corrected_peak,
-                "Peak_Frame_Error": corrected_peak - labeled_peak,
-                "Peak_Correction_Window_Used": peak_correction_window_used,
-                "Correction_Status": correction_status,
-
-                "CT_peak_height": peak_height,
-                "Peak_prominence": prominence,
-                "Peak_width": width,
-            })
-
-        param_df = pd.DataFrame(records)
-
-        if len(param_df) == 0:
-            return param_df
-
-        param_df = param_df.sort_values(
-            ["Fly", "Trial", "Leg", "Corrected_Peak_Frame"]
-        ).reset_index(drop=True)
-
-        # Optional diagnostic, even if you are not using distance as detector parameter
-        param_df["Peak_to_peak_distance"] = (
-            param_df
-            .groupby(["Fly", "Trial", "Leg"])["Corrected_Peak_Frame"]
-            .diff()
-        )
-
-        print(param_df["Correction_Status"].value_counts())
-
-        return param_df
 

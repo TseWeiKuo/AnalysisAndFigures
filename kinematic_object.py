@@ -12,6 +12,16 @@ warnings.filterwarnings(action="ignore", category=FutureWarning)
 # Helpers for reading and grouping 3D csv files
 # ------------------------------------------------------------
 
+class KinematicPath(str):
+    """String path carrying filename-derived metadata."""
+
+    def __new__(cls, path, fps=None, condition=None, timestamp=None):
+        obj = str.__new__(cls, path)
+        obj.fps = fps
+        obj.condition = condition
+        obj.timestamp = timestamp
+        return obj
+
 def group_files_by_fly(file_names):
     """
     Old filename parser.
@@ -115,7 +125,15 @@ def parse_new_names(file_names):
 
         fly_number = int(match.group("fly"))
         trial_number = int(match.group("trial"))
-        grouped_files[f"F{fly_number}T{trial_number}"] = file_path
+        fps_text = match.group("fps")
+        fps = int(fps_text) if fps_text is not None and fps_text.isdigit() else None
+        timestamp = f"{match.group('date')}_{match.group('time')}"
+        grouped_files[f"F{fly_number}T{trial_number}"] = KinematicPath(
+            file_path,
+            fps=fps,
+            condition=match.group("condition"),
+            timestamp=timestamp,
+        )
 
     return grouped_files
 
@@ -197,6 +215,12 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
         r"_Fly_?(?P<filename_fly>\d+)_Trial_?(?P<trial>\d+)_",
         re.IGNORECASE
     )
+    manifest_filename_pattern = re.compile(
+        r"^F(?P<filename_fly>\d+)_T(?P<trial>\d+)"
+        r"(?:_cond(?P<condition>[^_]+))?"
+        r"(?:_fps(?P<fps>\d+))?",
+        re.IGNORECASE
+    )
 
     for key, csv_path in grouped_paths.items():
         key_match = key_pattern.match(key)
@@ -215,8 +239,34 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
 
         filename = os.path.basename(csv_path)
         filename_match = filename_trial_pattern.search(filename)
-        filename_fly = int(filename_match.group("filename_fly")) if filename_match else np.nan
-        filename_trial = int(filename_match.group("trial")) if filename_match else np.nan
+        manifest_match = manifest_filename_pattern.search(filename)
+        active_filename_match = manifest_match if manifest_match else filename_match
+        filename_fly = (
+            int(active_filename_match.group("filename_fly"))
+            if active_filename_match
+            else np.nan
+        )
+        filename_trial = (
+            int(active_filename_match.group("trial"))
+            if active_filename_match
+            else np.nan
+        )
+        parsed_fps = getattr(csv_path, "fps", None)
+        if parsed_fps is None and manifest_match and manifest_match.group("fps"):
+            parsed_fps = int(manifest_match.group("fps"))
+        legacy_fps = (
+            group_info._legacy_fly_fps(metadata_fly)
+            if hasattr(group_info, "_legacy_fly_fps") and not pd.isna(metadata_fly)
+            else np.nan
+        )
+        if parsed_fps is None:
+            fps_status = "MISSING_FILENAME_FPS"
+        elif pd.isna(legacy_fps):
+            fps_status = "NO_LEGACY_FPS_TO_VALIDATE"
+        elif int(parsed_fps) == int(legacy_fps):
+            fps_status = "OK"
+        else:
+            fps_status = "FPS_MISMATCH"
 
         fly_matches_folder = (
             not pd.isna(metadata_fly)
@@ -244,6 +294,8 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
             statuses.append("MISSING_FILENAME_TRIAL")
         elif not trial_matches_filename:
             statuses.append("TRIAL_FILENAME_MISMATCH")
+        if fps_status == "FPS_MISMATCH":
+            statuses.append(fps_status)
 
         if not statuses:
             statuses.append("OK")
@@ -257,6 +309,9 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
             "Folder_Fly": folder_fly,
             "Filename_Fly_Within_Session": filename_fly,
             "Filename_Trial": filename_trial,
+            "Filename_FPS": parsed_fps if parsed_fps is not None else np.nan,
+            "Legacy_FPS": legacy_fps,
+            "FPS_Status": fps_status,
             "Metadata_Fly_Matches_Folder": fly_matches_folder,
             "Metadata_Trial_Matches_Filename": trial_matches_filename,
             "Status": ";".join(statuses),
@@ -275,6 +330,13 @@ def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
             "Folder_Fly": np.nan,
             "Filename_Fly_Within_Session": np.nan,
             "Filename_Trial": np.nan,
+            "Filename_FPS": np.nan,
+            "Legacy_FPS": (
+                group_info._legacy_fly_fps(int(key_match.group("fly")))
+                if hasattr(group_info, "_legacy_fly_fps") and key_match
+                else np.nan
+            ),
+            "FPS_Status": "NO_CSV_TO_VALIDATE",
             "Metadata_Fly_Matches_Folder": False,
             "Metadata_Trial_Matches_Filename": False,
             "Status": "MISSING_CSV_FOR_METADATA",
@@ -458,6 +520,45 @@ class Group:
             return "OFF"
         return None
 
+    def _legacy_fly_fps(self, fly):
+        if self.fps is None:
+            return None
+        if isinstance(self.fps, (int, float, np.integer, np.floating)):
+            return int(self.fps)
+        fly_idx = int(fly) - 1
+        if fly_idx < 0 or fly_idx >= len(self.fps):
+            return None
+        return int(self.fps[fly_idx])
+
+    def _parsed_path_fps(self, path):
+        fps = getattr(path, "fps", None)
+        if fps is None:
+            return None
+        return int(fps)
+
+    def _resolve_trial_fps(self, fly, trial, path):
+        parsed_fps = self._parsed_path_fps(path)
+        legacy_fps = self._legacy_fly_fps(fly)
+
+        if parsed_fps is not None:
+            if legacy_fps is not None and parsed_fps != legacy_fps:
+                warnings.warn(
+                    f"FPS mismatch for {self.group_name} F{fly}T{trial}: "
+                    f"filename fps={parsed_fps}, legacy FPS={legacy_fps}. "
+                    "Using filename FPS.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            return parsed_fps
+
+        if legacy_fps is not None:
+            return legacy_fps
+
+        raise ValueError(
+            f"Could not determine FPS for {self.group_name} F{fly}T{trial}. "
+            "Expected filename pattern containing '_fps###' or a legacy FPS fallback."
+        )
+
     def _classify_trial(self, val, max_latency):
         """
         Keep your current logic:
@@ -500,11 +601,6 @@ class Group:
         """
         if self.ll_data is None:
             raise ValueError(f"LL data is required to initialize group {self.group_name}.")
-        if self.fps is None or len(self.fps) < self.total_fly_number:
-            raise ValueError(
-                f"FPS list for {self.group_name} must contain at least {self.total_fly_number} values."
-            )
-
         self.landing_trial_index = []
         self.flying_trial_index = []
         self.not_flying_trial_index = []
@@ -513,8 +609,6 @@ class Group:
         missing_trials = []
 
         for i in range(self.total_fly_number):
-            max_latency = self.fps[i] * self.latency_threshold
-
             for t in range(self.trial_num):
                 fly = i + 1
                 trial = t + 1
@@ -527,6 +621,9 @@ class Group:
                     light = self._get_opto_label_from_path(path)
                 else:
                     missing_trials.append(key)
+
+                trial_fps = self._resolve_trial_fps(fly, trial, path)
+                max_latency = trial_fps * self.latency_threshold
 
                 ll_val = self.ll_data.iloc[i, t] if self.ll_data is not None else np.nan
                 moc_val = self.moc_data.iloc[i, t] if self.moc_data is not None else np.nan
@@ -543,7 +640,7 @@ class Group:
                     "LL": ll_val,
                     "MOC": moc_val,
                     "MOL": mol_val,
-                    "fps": self.fps[i],
+                    "fps": trial_fps,
                     "TrialType": trial_type,
                     "Path": path,
                     "Light": light
@@ -574,11 +671,6 @@ class Group:
         """
         if self.ll_data is None:
             raise ValueError(f"LL data is required to initialize Chr group {self.group_name}.")
-        if self.fps is None or len(self.fps) < self.total_fly_number:
-            raise ValueError(
-                f"FPS list for {self.group_name} must contain at least {self.total_fly_number} values."
-            )
-
         self.landing_trial_index = []
         self.flying_trial_index = []
         self.not_flying_trial_index = []
@@ -599,6 +691,8 @@ class Group:
                     light = self._get_opto_label_from_path(path)
                 else:
                     missing_trials.append(key)
+
+                trial_fps = self._resolve_trial_fps(fly, trial, path)
 
                 ll_val = self.ll_data.iloc[i, t]
 
@@ -624,7 +718,7 @@ class Group:
                     "LL": ll_val,
                     "MOC": np.nan,
                     "MOL": mol_val,
-                    "fps": self.fps[i],
+                    "fps": trial_fps,
                     "TrialType": trial_type,
                     "Path": path,
                     "Light": light
