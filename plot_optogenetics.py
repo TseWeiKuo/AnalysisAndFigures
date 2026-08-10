@@ -13,6 +13,8 @@ from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
 from openpyxl import load_workbook
 
+import tracking_qc as tqc
+
 
 def _significance_label(p_value, missing_label=""):
     if pd.isna(p_value):
@@ -35,10 +37,12 @@ def _detect_chrimson_wing_mol(
         window_start=750,
         window_stop=1250,
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -50,10 +54,14 @@ def _detect_chrimson_wing_mol(
         trial_info,
         wing_angle_def,
         apply_tracking_qc=apply_tracking_qc,
-        tracking_error_thresholds=tracking_error_thresholds,
         min_cameras=min_cameras,
-        max_interp_gap_frames=max_interp_gap_frames,
+        max_interp_gap_s=max_interp_gap_s,
         min_valid_fraction=min_valid_fraction,
+        # Use the same fixed error/score/camera QC rule as the rest of the
+        # analysis whenever wing-based MOL detection is QC-filtered.
+        error_max=error_max,
+        score_min=score_min,
+        require_score=require_score,
         smooth_angle=smooth_angle,
         smooth_window_frames=smooth_window_frames,
         smooth_polyorder=smooth_polyorder,
@@ -87,6 +95,9 @@ def _detect_chrimson_wing_mol(
     window_valid_fraction = float(np.mean(finite_window)) if len(finite_window) else np.nan
     window_gaps = self.calculator.invalid_gap_lengths(finite_window) if len(finite_window) else []
     max_window_gap = int(max(window_gaps)) if window_gaps else 0
+    # Resolve the time-based interpolation threshold in this trial's FPS before
+    # evaluating the wing detection window.
+    max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
 
     qc_passed = True
     exclusion_reason = ""
@@ -110,6 +121,7 @@ def _detect_chrimson_wing_mol(
             "Wing_QC_Exclusion_Reason": exclusion_reason,
             "Wing_Window_Valid_Fraction": window_valid_fraction,
             "Wing_Window_Max_Invalid_Gap_Frames": max_window_gap,
+            "Wing_Max_Interp_Gap_s": max_interp_gap_s,
             "Wing_Window_Start_Frame": start,
             "Wing_Window_Stop_Frame": stop - 1,
             "Apply_Tracking_QC": bool(apply_tracking_qc),
@@ -121,6 +133,7 @@ def _detect_chrimson_wing_mol(
         "Wing_QC_Exclusion_Reason": "",
         "Wing_Window_Valid_Fraction": window_valid_fraction,
         "Wing_Window_Max_Invalid_Gap_Frames": max_window_gap,
+        "Wing_Max_Interp_Gap_s": max_interp_gap_s,
         "Wing_Window_Start_Frame": start,
         "Wing_Window_Stop_Frame": stop - 1,
         "Apply_Tracking_QC": bool(apply_tracking_qc),
@@ -320,10 +333,12 @@ def plot_chrimson_LP(
         color="red",
         threshold=0.71,
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -397,10 +412,14 @@ def plot_chrimson_LP(
                     trial_info,
                     wing_angle_def=angs,
                     apply_tracking_qc=apply_tracking_qc,
-                    tracking_error_thresholds=tracking_error_thresholds,
                     min_cameras=min_cameras,
-                    max_interp_gap_frames=max_interp_gap_frames,
+                    max_interp_gap_s=max_interp_gap_s,
                     min_valid_fraction=min_valid_fraction,
+                    # Forward caller-specified QC thresholds into MOL
+                    # detection rather than using hidden defaults.
+                    error_max=error_max,
+                    score_min=score_min,
+                    require_score=require_score,
                     smooth_angle=smooth_angle,
                     smooth_window_frames=smooth_window_frames,
                     smooth_polyorder=smooth_polyorder
@@ -785,10 +804,12 @@ def plot_chrimson_LP_change_summary(
         intensity_colors=None,
         mean_color="black",
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2
@@ -895,10 +916,14 @@ def plot_chrimson_LP_change_summary(
                 trial_info,
                 wing_angle_def=angle_defs,
                 apply_tracking_qc=apply_tracking_qc,
-                tracking_error_thresholds=tracking_error_thresholds,
                 min_cameras=min_cameras,
-                max_interp_gap_frames=max_interp_gap_frames,
+                max_interp_gap_s=max_interp_gap_s,
                 min_valid_fraction=min_valid_fraction,
+                # Keep CsChrimson LP-change QC synchronized with the shared
+                # fixed-threshold rule used by angle and trajectory analyses.
+                error_max=error_max,
+                score_min=score_min,
+                require_score=require_score,
                 smooth_angle=smooth_angle,
                 smooth_window_frames=smooth_window_frames,
                 smooth_polyorder=smooth_polyorder

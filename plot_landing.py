@@ -11,6 +11,7 @@ from matplotlib import colors as mcolors
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
 
+import tracking_qc as tqc
 import trial_helpers as th
 
 
@@ -598,9 +599,8 @@ def plot_it_ot_landing_probability_and_latency(
         use_absolute_angular_velocity=True,
         colors=None,
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
@@ -800,9 +800,8 @@ def plot_it_ot_landing_probability_and_latency(
             trial_info,
             [angle_def],
             apply_tracking_qc=apply_tracking_qc,
-            tracking_error_thresholds=tracking_error_thresholds,
             min_cameras=min_cameras,
-            max_interp_gap_frames=max_interp_gap_frames,
+            max_interp_gap_s=max_interp_gap_s,
             min_valid_fraction=min_valid_fraction,
             error_max=error_max,
             score_min=score_min,
@@ -854,6 +853,9 @@ def plot_it_ot_landing_probability_and_latency(
         valid = np.isfinite(source_time) & np.isfinite(source_trace)
         window_valid_fraction = float(np.mean(valid)) if len(valid) else np.nan
         max_invalid_gap = max(self.calculator.invalid_gap_lengths(valid), default=0)
+        # Resolve the time-based interpolation threshold in this trial's FPS
+        # before applying the final plotted-window QC check.
+        max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, fps)
         if apply_tracking_qc and (
                 window_valid_fraction < min_valid_fraction
                 or max_invalid_gap > max_interp_gap_frames
@@ -870,6 +872,7 @@ def plot_it_ot_landing_probability_and_latency(
                 "Valid_Frame_Fraction": window_valid_fraction,
                 "Max_Invalid_Gap_Frames": max_invalid_gap,
                 "Min_Valid_Fraction": min_valid_fraction,
+                "Max_Interp_Gap_s": max_interp_gap_s,
                 "Max_Interp_Gap_Frames": max_interp_gap_frames,
             })
             continue

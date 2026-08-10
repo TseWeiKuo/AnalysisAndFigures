@@ -116,25 +116,11 @@ class SimpleCalculation:
             kinematic_data.trial_data[point].z_coord
         ]))
 
-    def load_tracking_error_thresholds(self, threshold_source):
-        if threshold_source is None:
-            return None
-        if isinstance(threshold_source, dict):
-            return threshold_source
-
-        threshold_df = pd.read_csv(threshold_source)
-        key_col = "Keypoint"
-        threshold_col = "Error_Threshold"
-        if key_col not in threshold_df.columns or threshold_col not in threshold_df.columns:
-            raise ValueError(f"Threshold file must contain '{key_col}' and '{threshold_col}' columns.")
-        return dict(zip(threshold_df[key_col], threshold_df[threshold_col]))
-
     def get_tracking_qc_mask(
             self,
             trial_info,
             keypoints,
             min_cameras=2,
-            error_thresholds=None,
             require_finite_error=True,
             error_max=50,
             score_min=0.8,
@@ -149,7 +135,6 @@ class SimpleCalculation:
         """
         if isinstance(keypoints, str):
             keypoints = [keypoints]
-        error_thresholds = self.load_tracking_error_thresholds(error_thresholds)
 
         n_frames = int(trial_info.total_frames_number)
         combined_mask = np.ones(n_frames, dtype=bool)
@@ -170,7 +155,6 @@ class SimpleCalculation:
                 point=point,
                 keypoint=keypoint,
                 min_cameras=min_cameras,
-                error_thresholds=error_thresholds,
                 error_max=error_max,
                 score_min=score_min,
                 require_score=require_score,
@@ -296,8 +280,7 @@ class SimpleCalculation:
             angle_trace,
             angle_points,
             min_cameras=2,
-            error_thresholds=None,
-            max_interp_gap_frames=5,
+            max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
@@ -313,16 +296,16 @@ class SimpleCalculation:
         """
         Apply tracking QC to one angle trace.
 
-        Invalid frames are set to NaN. Short gaps are linearly interpolated;
-        windows containing longer invalid gaps should be skipped by callers
-        using the returned summary.
+        Invalid frames are set to NaN. Short gaps are linearly interpolated
+        using a time-based threshold resolved from the trial FPS.
         """
+        # Convert the 20 ms interpolation rule to this trial's native frame count.
+        max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
         angle_trace = np.asarray(angle_trace, dtype=float).copy()
         qc_mask, point_summary = self.get_tracking_qc_mask(
             trial_info,
             angle_points,
             min_cameras=min_cameras,
-            error_thresholds=error_thresholds,
             require_finite_error=True,
             error_max=error_max,
             score_min=score_min,
@@ -352,11 +335,13 @@ class SimpleCalculation:
             start_frame=start_frame,
             end_frame=end_frame,
             max_interp_gap_frames=max_interp_gap_frames,
+            max_interp_gap_s=max_interp_gap_s,
             min_valid_fraction=min_valid_fraction,
         )
         summary.update({
             "Interpolated_Frame_Count": int(interpolated_count),
             "Min_Cameras": min_cameras,
+            "Max_Interp_Gap_s": max_interp_gap_s,
             "Error_Max": error_max,
             "Score_Min": score_min,
             "Require_Score": bool(require_score),
@@ -372,8 +357,7 @@ class SimpleCalculation:
             trial_info,
             keypoint,
             min_cameras=2,
-            error_thresholds=None,
-            max_interp_gap_frames=5,
+            max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
@@ -385,17 +369,16 @@ class SimpleCalculation:
         """
         Apply tracking QC to one keypoint's xyz trace.
 
-        Invalid frames are set to NaN, and NaN gaps up to max_interp_gap_frames
-        are linearly interpolated independently for x/y/z. Callers should skip
-        windows with Max_Invalid_Gap_Frames > max_interp_gap_frames.
+        Invalid frames are set to NaN, and invalid gaps up to max_interp_gap_s
+        are linearly interpolated independently for x/y/z.
         """
-        error_thresholds = self.load_tracking_error_thresholds(error_thresholds)
+        # Convert the 20 ms interpolation rule to this trial's native frame count.
+        max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
         point = trial_info.trial_data[keypoint]
         xyz, components, metadata = tqc.point_invalid_components(
             point=point,
             keypoint=keypoint,
             min_cameras=min_cameras,
-            error_thresholds=error_thresholds,
             error_max=error_max,
             score_min=score_min,
             require_score=require_score,
@@ -410,7 +393,7 @@ class SimpleCalculation:
         if start_frame is None:
             start_frame = 0
         if end_frame is None:
-            end_frame = len(qc_mask) - 1
+            end_frame = len(invalid_mask) - 1
         start_frame = max(int(start_frame), 0)
         end_frame = min(int(end_frame), len(invalid_mask) - 1)
         summary = tqc.summarize_invalid_mask(
@@ -419,6 +402,7 @@ class SimpleCalculation:
             start_frame=start_frame,
             end_frame=end_frame,
             max_interp_gap_frames=max_interp_gap_frames,
+            max_interp_gap_s=max_interp_gap_s,
             min_valid_fraction=min_valid_fraction,
             require_start_end_valid=require_start_end_valid,
         )
@@ -426,6 +410,7 @@ class SimpleCalculation:
             "Keypoint": keypoint,
             "Interpolated_Frame_Count": int(interpolated_count),
             "Min_Cameras": min_cameras,
+            "Max_Interp_Gap_s": max_interp_gap_s,
             "Error_Max": error_max,
             "Score_Min": score_min,
             "Require_Score": bool(require_score),
@@ -449,9 +434,8 @@ class SimpleCalculation:
             trial_info,
             angles,
             apply_tracking_qc=False,
-            tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=5,
+            max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
@@ -485,8 +469,7 @@ class SimpleCalculation:
                         angle_trace=collected_angle_data[joint_name],
                         angle_points=wing_points,
                         min_cameras=min_cameras,
-                        error_thresholds=tracking_error_thresholds,
-                        max_interp_gap_frames=max_interp_gap_frames,
+                        max_interp_gap_s=max_interp_gap_s,
                         min_valid_fraction=min_valid_fraction,
                         error_max=error_max,
                         score_min=score_min,
@@ -529,8 +512,7 @@ class SimpleCalculation:
                         angle_trace=collected_angle_data[joint_name],
                         angle_points=ag,
                         min_cameras=min_cameras,
-                        error_thresholds=tracking_error_thresholds,
-                        max_interp_gap_frames=max_interp_gap_frames,
+                        max_interp_gap_s=max_interp_gap_s,
                         min_valid_fraction=min_valid_fraction,
                         error_max=error_max,
                         score_min=score_min,
@@ -1202,9 +1184,8 @@ class GroupDataAnalyzer:
             end=0.5,
             chrimson=False,
             apply_tracking_qc=False,
-            tracking_error_thresholds=None,
             min_cameras=2,
-            max_interp_gap_frames=5,
+            max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
@@ -1254,13 +1235,22 @@ class GroupDataAnalyzer:
                 })
                 continue
 
+            # Convert the requested QC window from seconds around the alignment
+            # frame into absolute frame indices before angle QC is calculated.
+            qc_start_frame = None
+            qc_end_frame = None
+            if apply_tracking_qc:
+                qc_window_start_s = start if qc_start is None else qc_start
+                qc_window_end_s = end if qc_end is None else qc_end
+                qc_start_frame = int(MOC) + int(qc_window_start_s * trial_info.fps)
+                qc_end_frame = int(MOC) + int(qc_window_end_s * trial_info.fps) - 1
+
             angle_result = self.calculator.Calculate_joint_angle(
                 trial_info,
                 angles,
                 apply_tracking_qc=apply_tracking_qc,
-                tracking_error_thresholds=tracking_error_thresholds,
                 min_cameras=min_cameras,
-                max_interp_gap_frames=max_interp_gap_frames,
+                max_interp_gap_s=max_interp_gap_s,
                 min_valid_fraction=min_valid_fraction,
                 error_max=error_max,
                 score_min=score_min,
@@ -1270,6 +1260,10 @@ class GroupDataAnalyzer:
                 smooth_window_frames=smooth_window_frames,
                 smooth_polyorder=smooth_polyorder,
                 smooth_alpha=smooth_alpha,
+                # The angle QC summary and pass/fail rule should describe the
+                # same analysis window that the downstream trace uses.
+                qc_start=qc_start_frame,
+                qc_end=qc_end_frame,
                 return_qc=apply_tracking_qc
             )
             if apply_tracking_qc:
@@ -1292,10 +1286,16 @@ class GroupDataAnalyzer:
                 Joint_signal = np.asarray(angs[joint_name][trace_start:trace_end])
 
                 if apply_tracking_qc:
+                    # Resolve the time-based gap rule in the trial's native FPS
+                    # before checking plotted-window validity.
+                    max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
+                    # Reuse the absolute QC frames passed into angle
+                    # calculation so the secondary finite-sample guard is
+                    # aligned with the primary QC summary.
                     qc_window_start_s = start if qc_start is None else qc_start
                     qc_window_end_s = end if qc_end is None else qc_end
-                    qc_trace_start = int(MOC) + int(qc_window_start_s * trial_info.fps)
-                    qc_trace_end = int(MOC) + int(qc_window_end_s * trial_info.fps)
+                    qc_trace_start = qc_start_frame
+                    qc_trace_end = qc_end_frame + 1
                     qc_trace_start = max(qc_trace_start, trace_start)
                     qc_trace_end = min(qc_trace_end, trace_end)
                     qc_start_offset = max(qc_trace_start - trace_start, 0)
@@ -1338,6 +1338,7 @@ class GroupDataAnalyzer:
                             "Window_Valid_Frame_Fraction": window_valid_fraction,
                             "Window_Max_Invalid_Gap_Frames": max_window_gap,
                             "Min_Valid_Fraction": min_valid_fraction,
+                            "Max_Interp_Gap_s": max_interp_gap_s,
                             "Max_Interp_Gap_Frames": max_interp_gap_frames,
                             "Min_Cameras": min_cameras,
                         })

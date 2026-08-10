@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+import tracking_qc as tqc
 import trial_helpers as th
 
 def plot_selected_chrimson_angle_traces(
@@ -23,10 +24,12 @@ def plot_selected_chrimson_angle_traces(
         colors=None,
         show_sem=True,
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
         smooth_angle=True,
         smooth_window_frames=5,
         smooth_polyorder=2,
@@ -83,10 +86,14 @@ def plot_selected_chrimson_angle_traces(
             end=end,
             chrimson=True,
             apply_tracking_qc=apply_tracking_qc,
-            tracking_error_thresholds=tracking_error_thresholds,
             min_cameras=min_cameras,
-            max_interp_gap_frames=max_interp_gap_frames,
+            max_interp_gap_s=max_interp_gap_s,
             min_valid_fraction=min_valid_fraction,
+            # Forward the current fixed-threshold QC rule instead of relying on
+            # calculator defaults when optogenetic angle QC is enabled.
+            error_max=error_max,
+            score_min=score_min,
+            require_score=require_score,
             smooth_angle=smooth_angle,
             smooth_window_frames=smooth_window_frames,
             smooth_polyorder=smooth_polyorder,
@@ -215,9 +222,8 @@ def plot_wt_contact_group_angle_traces(
         trial_types=("Landing", "Flying"),
         show_sem=True,
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
@@ -345,9 +351,8 @@ def plot_wt_contact_group_angle_traces(
                 trial_info,
                 [angle_def],
                 apply_tracking_qc=apply_tracking_qc,
-                tracking_error_thresholds=tracking_error_thresholds,
                 min_cameras=min_cameras,
-                max_interp_gap_frames=max_interp_gap_frames,
+                max_interp_gap_s=max_interp_gap_s,
                 min_valid_fraction=min_valid_fraction,
                 error_max=error_max,
                 score_min=score_min,
@@ -398,6 +403,9 @@ def plot_wt_contact_group_angle_traces(
             valid = np.isfinite(source_time) & np.isfinite(source_trace)
             window_valid_fraction = float(np.mean(valid)) if len(valid) else np.nan
             max_invalid_gap = max(self.calculator.invalid_gap_lengths(valid), default=0)
+            # Resolve the time-based interpolation threshold in this trial's FPS
+            # before applying the final plotted-window QC check.
+            max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, fps)
             if apply_tracking_qc and (
                     window_valid_fraction < min_valid_fraction
                     or max_invalid_gap > max_interp_gap_frames
@@ -414,6 +422,7 @@ def plot_wt_contact_group_angle_traces(
                     "Valid_Frame_Fraction": window_valid_fraction,
                     "Max_Invalid_Gap_Frames": max_invalid_gap,
                     "Min_Valid_Fraction": min_valid_fraction,
+                    "Max_Interp_Gap_s": max_interp_gap_s,
                     "Max_Interp_Gap_Frames": max_interp_gap_frames,
                 })
                 continue
@@ -496,7 +505,7 @@ def plot_wt_contact_group_angle_traces(
                     "trace_value": "angle_change_from_pre_MOC_mean_deg",
                     "apply_tracking_qc": apply_tracking_qc,
                     "min_cameras": min_cameras if apply_tracking_qc else np.nan,
-                    "max_interp_gap_frames": max_interp_gap_frames if apply_tracking_qc else np.nan,
+                    "max_interp_gap_s": max_interp_gap_s if apply_tracking_qc else np.nan,
                     "min_valid_fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                     "smooth_angle": smooth_angle,
                     "smooth_method": smooth_method if smooth_angle else "",
@@ -600,6 +609,305 @@ def plot_wt_contact_group_angle_traces(
 
     plt.close()
     return fig, axes, summary_df
+
+def flight_postural_change(
+        self,
+        group_info,
+        angle_def=("R-mCT", "R-mFT", "R-mTT"),
+        trial_types=("Landing", "Flying"),
+        pre_moc_window_s=0.5,
+        max_trial_num=20,
+        colors=None,
+        show_sem=True,
+        file_name="flight_postural_change",
+        apply_tracking_qc=False,
+        min_cameras=2,
+        max_interp_gap_s=0.02,
+        min_valid_fraction=0.7,
+        error_max=50,
+        score_min=0.8,
+        require_score=False,
+        smooth_angle=False,
+        smooth_method="savgol",
+        smooth_window_frames=5,
+        smooth_polyorder=2,
+        smooth_alpha=0.4,
+        save_csv=True
+):
+    """
+    Plot trial-by-trial pre-MOC flight posture from one joint angle.
+
+    Each fly contributes at most one value per trial number: the mean angle
+    from pre_moc_window_s before MOC up to MOC. The plotted line is the mean
+    across flies for each trial number, and the shade is fly-level SEM.
+    """
+    # Normalize the input so callers can pass one Group, a list of Groups, or a
+    # label-to-Group mapping while sharing the same aggregation code.
+    if isinstance(group_info, dict):
+        group_items = list(group_info.items())
+    elif isinstance(group_info, (list, tuple)):
+        group_items = [(group.group_name, group) for group in group_info]
+    else:
+        group_items = [(group_info.group_name, group_info)]
+
+    # Use a stable categorical palette unless the notebook supplies group
+    # colors keyed by label or group name.
+    if colors is None:
+        colors = sns.color_palette("tab10", len(group_items))
+
+    angle_def = tuple(angle_def)
+    joint_name = angle_def[1]
+    value_rows = []
+    summary_rows = []
+    qc_rows = []
+    skipped_rows = []
+
+    for group_idx, (group_label, current_group) in enumerate(group_items):
+        # Prepare metadata and kinematic traces in the same lazy style as the
+        # other WT plotting functions.
+        if len(current_group.trial_metadata) == 0:
+            current_group.initialize_manual_data()
+        current_group.filter_nan_fly()
+        current_group.read_kinematic_data(list(trial_types))
+
+        for fly_num in current_group.good_fly_index:
+            for trial_num in range(1, int(max_trial_num) + 1):
+                key = current_group._trial_key(fly_num, trial_num)
+                if key not in current_group.trial_metadata:
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "missing metadata",
+                    })
+                    continue
+
+                meta = current_group.trial_metadata[key]
+                if meta.get("TrialType") not in trial_types:
+                    continue
+                if key not in current_group.fly_kinematic_data:
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "missing kinematic data",
+                    })
+                    continue
+
+                trial_info = current_group.fly_kinematic_data[key]
+                moc = trial_info.moc
+                fps = trial_info.fps
+                if pd.isna(moc) or pd.isna(fps):
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "missing MOC or fps",
+                    })
+                    continue
+
+                # Define the exact pre-MOC frame window used for both QC and
+                # the final posture value. MOC itself is excluded.
+                moc = int(moc)
+                fps = float(fps)
+                start_frame = int(round(moc - pre_moc_window_s * fps))
+                end_frame = moc - 1
+                if start_frame < 0 or end_frame <= start_frame or end_frame >= trial_info.total_frames_number:
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "incomplete pre-MOC window",
+                        "MOC_Frame": moc,
+                        "Window_Start_Frame": start_frame,
+                        "Window_End_Frame": end_frame,
+                    })
+                    continue
+                if any(point not in trial_info.trial_data for point in angle_def):
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "missing angle keypoint",
+                        "Angle_Definition": "|".join(angle_def),
+                    })
+                    continue
+
+                # Calculate the angle trace and, when requested, apply the
+                # current tracking QC only to the pre-MOC posture window.
+                angle_result = self.calculator.Calculate_joint_angle(
+                    trial_info,
+                    [list(angle_def)],
+                    apply_tracking_qc=apply_tracking_qc,
+                    min_cameras=min_cameras,
+                    max_interp_gap_s=max_interp_gap_s,
+                    min_valid_fraction=min_valid_fraction,
+                    error_max=error_max,
+                    score_min=score_min,
+                    require_score=require_score,
+                    smooth_angle=smooth_angle,
+                    smooth_method=smooth_method,
+                    smooth_window_frames=smooth_window_frames,
+                    smooth_polyorder=smooth_polyorder,
+                    smooth_alpha=smooth_alpha,
+                    qc_start=start_frame,
+                    qc_end=end_frame,
+                    return_qc=apply_tracking_qc
+                )
+                if apply_tracking_qc:
+                    angle_data, angle_qc_df = angle_result
+                    if not angle_qc_df.empty:
+                        qc_record = angle_qc_df.iloc[0].to_dict()
+                        qc_record.update({
+                            "Group_Label": group_label,
+                            "Group_Name": current_group.group_name,
+                            "Fly#": fly_num,
+                            "Trial#": trial_num,
+                            "Window_Start_Frame": start_frame,
+                            "Window_End_Frame": end_frame,
+                        })
+                        qc_rows.append(qc_record)
+                        if not bool(qc_record.get("QC_Passed", True)):
+                            skipped_rows.append({
+                                "Group_Label": group_label,
+                                "Group_Name": current_group.group_name,
+                                "Fly#": fly_num,
+                                "Trial#": trial_num,
+                                "Reason": "failed posture tracking QC",
+                                **qc_record,
+                            })
+                            continue
+                else:
+                    angle_data = angle_result
+
+                # Average the finite angle samples inside the pre-MOC window to
+                # produce one posture value for this fly/trial number.
+                window_trace = np.asarray(angle_data[joint_name][start_frame:end_frame + 1], dtype=float)
+                finite_trace = window_trace[np.isfinite(window_trace)]
+                if len(finite_trace) == 0:
+                    skipped_rows.append({
+                        "Group_Label": group_label,
+                        "Group_Name": current_group.group_name,
+                        "Fly#": fly_num,
+                        "Trial#": trial_num,
+                        "Reason": "no finite pre-MOC angle samples",
+                        "Window_Start_Frame": start_frame,
+                        "Window_End_Frame": end_frame,
+                    })
+                    continue
+
+                value_rows.append({
+                    "Group_Label": group_label,
+                    "Group_Name": current_group.group_name,
+                    "Fly#": fly_num,
+                    "Trial#": trial_num,
+                    "TrialType": meta.get("TrialType"),
+                    "Joint": joint_name,
+                    "Angle_Definition": "|".join(angle_def),
+                    "MOC_Frame": moc,
+                    "FPS": fps,
+                    "Window_Start_Frame": start_frame,
+                    "Window_End_Frame": end_frame,
+                    "Pre_MOC_Window_s": pre_moc_window_s,
+                    "Mean_Pre_MOC_Angle_deg": float(np.nanmean(finite_trace)),
+                    "Finite_Frame_Count": int(len(finite_trace)),
+                    "Apply_Tracking_QC": bool(apply_tracking_qc),
+                })
+
+    value_df = pd.DataFrame(value_rows)
+    if value_df.empty:
+        raise ValueError("No valid pre-MOC posture values were available for plotting.")
+
+    # Collapse fly-trial values by trial number. The SEM is across flies within
+    # each trial number, not across pooled frames or pooled trials.
+    for (group_label, group_name, trial_num), sub in value_df.groupby(["Group_Label", "Group_Name", "Trial#"]):
+        values = sub["Mean_Pre_MOC_Angle_deg"].astype(float).dropna().to_numpy()
+        n_flies = len(values)
+        sem = np.nan
+        if n_flies > 1:
+            sem = float(np.nanstd(values, ddof=1) / np.sqrt(n_flies))
+        summary_rows.append({
+            "Group_Label": group_label,
+            "Group_Name": group_name,
+            "Trial#": trial_num,
+            "Joint": joint_name,
+            "Mean_Pre_MOC_Angle_deg": float(np.nanmean(values)) if n_flies else np.nan,
+            "SEM_Pre_MOC_Angle_deg": sem,
+            "SD_Pre_MOC_Angle_deg": float(np.nanstd(values, ddof=1)) if n_flies > 1 else np.nan,
+            "n_flies": n_flies,
+            "Pre_MOC_Window_s": pre_moc_window_s,
+            "Apply_Tracking_QC": bool(apply_tracking_qc),
+        })
+    summary_df = pd.DataFrame(summary_rows).sort_values(["Group_Label", "Trial#"]).reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
+    plotted_values = []
+    for group_idx, (group_label, current_group) in enumerate(group_items):
+        sub = summary_df[summary_df["Group_Label"] == group_label].sort_values("Trial#")
+        if sub.empty:
+            continue
+
+        # Resolve group color by label, by internal group name, or by plotting
+        # order so notebook-level color dictionaries work naturally.
+        if isinstance(colors, dict):
+            color = colors.get(group_label, colors.get(current_group.group_name, "black"))
+        else:
+            color = colors[group_idx % len(colors)]
+
+        x = sub["Trial#"].to_numpy(dtype=float)
+        y = sub["Mean_Pre_MOC_Angle_deg"].to_numpy(dtype=float)
+        sem = sub["SEM_Pre_MOC_Angle_deg"].to_numpy(dtype=float)
+        plotted_values.append(y)
+        if show_sem:
+            plotted_values.extend([y - sem, y + sem])
+
+        ax.plot(x, y, color=color, linewidth=2.4, marker="o", markersize=4, label=str(group_label))
+        if show_sem:
+            ax.fill_between(x, y - sem, y + sem, color=color, alpha=0.18, linewidth=0)
+
+    # Format the trial-number axis with integer ticks and scale the y-axis to
+    # include both the mean trace and SEM ribbon.
+    ax.set_xlim(0.5, max_trial_num + 0.5)
+    ax.set_xticks(np.arange(1, int(max_trial_num) + 1))
+    ax.set_xlabel("Trial number")
+    ax.set_ylabel(f"{joint_name} pre-MOC mean angle (deg)")
+    ax.set_title(f"{joint_name} flight posture before MOC")
+    if plotted_values:
+        finite_arrays = [
+            np.asarray(values, dtype=float)[np.isfinite(values)]
+            for values in plotted_values
+            if np.any(np.isfinite(values))
+        ]
+        if finite_arrays:
+            finite_values = np.concatenate(finite_arrays)
+            y_min = float(np.nanmin(finite_values))
+            y_max = float(np.nanmax(finite_values))
+            y_pad = max((y_max - y_min) * 0.08, 2.0)
+            ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax.legend(frameon=False, fontsize=8)
+    self.formatting(ax)
+    sns.despine(trim=True)
+    plt.tight_layout()
+
+    if file_name is not None:
+        plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    qc_df = pd.DataFrame(qc_rows)
+    skipped_df = pd.DataFrame(skipped_rows)
+    if save_csv and file_name is not None:
+        value_df.to_csv(f"{file_name}_fly_trial_values.csv", index=False)
+        summary_df.to_csv(f"{file_name}_trial_summary.csv", index=False)
+        if apply_tracking_qc:
+            qc_df.to_csv(f"{file_name}_tracking_qc_summary.csv", index=False)
+            skipped_df.to_csv(f"{file_name}_tracking_qc_skipped_trials.csv", index=False)
+
+    return fig, ax, value_df, summary_df, qc_df, skipped_df
 
 def _resampled_angle_traces_for_indexes(
         self,

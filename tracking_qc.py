@@ -14,11 +14,10 @@ class TrackingQCConfig:
     """Tracking-QC options without coupling them to a plotting workflow."""
 
     enabled: bool = False
-    error_thresholds: dict | None = None
     error_max: float = 50
     score_min: float = 0.8
     min_cameras: int = 2
-    max_interp_gap_frames: int = 5
+    max_interp_gap_s: float = 0.02
     min_valid_fraction: float = 0.7
     require_score: bool = False
 
@@ -33,9 +32,7 @@ class TrackingQCConfig:
             "Min_Cameras": self.min_cameras if self.enabled else np.nan,
             "Error_Max": self.error_max if self.enabled else np.nan,
             "Score_Min": self.score_min if self.enabled else np.nan,
-            "Max_Interp_Gap_Frames": (
-                self.max_interp_gap_frames if self.enabled else np.nan
-            ),
+            "Max_Interp_Gap_s": self.max_interp_gap_s if self.enabled else np.nan,
             "Min_Valid_Fraction": (
                 self.min_valid_fraction if self.enabled else np.nan
             ),
@@ -46,39 +43,32 @@ class TrackingQCConfig:
         }
 
 
-def from_legacy_arguments(
+def build_config(
         apply_tracking_qc=False,
-        tracking_error_thresholds=None,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
         require_score=False,
 ):
-    """Build a config while public plotting methods retain existing arguments."""
+    """Build a QC config from the current fixed-threshold, time-gap rule."""
     return TrackingQCConfig(
         enabled=apply_tracking_qc,
-        error_thresholds=tracking_error_thresholds,
         error_max=error_max,
         score_min=score_min,
         min_cameras=min_cameras,
-        max_interp_gap_frames=max_interp_gap_frames,
+        max_interp_gap_s=max_interp_gap_s,
         min_valid_fraction=min_valid_fraction,
         require_score=require_score,
     )
 
 
-def _resolve_error_threshold(error_thresholds, keypoint, default_error_max=50):
-    if error_thresholds is None:
-        return default_error_max
-    if isinstance(error_thresholds, dict):
-        value = error_thresholds.get(keypoint, default_error_max)
-    else:
-        value = error_thresholds
-    if value is None or pd.isna(value):
-        return default_error_max
-    return float(value)
+def interp_gap_frames_from_fps(max_interp_gap_s, fps):
+    """Convert the time-based interpolation threshold into trial-local frames."""
+    if fps is None or pd.isna(fps) or float(fps) <= 0:
+        raise ValueError("fps must be finite and > 0 to resolve time-based QC interpolation.")
+    return max(1, int(round(float(max_interp_gap_s) * float(fps))))
 
 
 def _optional_score_array(point):
@@ -94,7 +84,6 @@ def point_invalid_components(
         point,
         keypoint,
         min_cameras=2,
-        error_thresholds=None,
         error_max=50,
         score_min=0.8,
         require_score=False,
@@ -113,7 +102,8 @@ def point_invalid_components(
     camera_count = camera_count[:n_frames]
     error = error[:n_frames]
 
-    threshold = _resolve_error_threshold(error_thresholds, keypoint, error_max)
+    # The current QC rule uses one fixed reprojection-error cutoff for every keypoint.
+    threshold = float(error_max)
     xyz_missing = ~(np.isfinite(x) & np.isfinite(y) & np.isfinite(z))
     camera_missing = ~np.isfinite(camera_count)
     low_camera = np.isfinite(camera_count) & (camera_count < min_cameras)
@@ -169,11 +159,17 @@ def summarize_invalid_mask(
         components=None,
         start_frame=None,
         end_frame=None,
-        max_interp_gap_frames=5,
+        max_interp_gap_frames=None,
+        max_interp_gap_s=0.02,
+        fps=None,
         min_valid_fraction=0.7,
         require_start_end_valid=False,
 ):
     """Summarize one frame-wise invalid mask using the current QC rule."""
+    # Resolve the time-based interpolation rule once so all gap statistics use
+    # the same effective frame threshold for this trial.
+    if max_interp_gap_frames is None:
+        max_interp_gap_frames = interp_gap_frames_from_fps(max_interp_gap_s, fps)
     invalid_mask = np.asarray(invalid_mask, dtype=bool)
     n_frames = len(invalid_mask)
     if start_frame is None:
@@ -233,6 +229,7 @@ def summarize_invalid_mask(
         "Interpolatable_Invalid_Fraction": _fraction(interpolatable_count, total_frames),
         "Start_Frame_Valid": start_valid,
         "End_Frame_Valid": end_valid,
+        "Max_Interp_Gap_s": max_interp_gap_s,
         "Max_Interp_Gap_Frames": max_interp_gap_frames,
         "Min_Valid_Fraction": min_valid_fraction,
         "Max_Invalid_Fraction": max_invalid_fraction,
@@ -581,7 +578,7 @@ def _summarize_one_trial_keypoint(
         error_max,
         score_min,
         min_cameras,
-        max_interp_gap_frames,
+        max_interp_gap_s,
         max_invalid_fraction,
         require_score,
 ):
@@ -595,6 +592,9 @@ def _summarize_one_trial_keypoint(
         margin_s,
         window_mode,
     )
+    # Gap interpolation is specified in seconds and resolved to frames using
+    # the native FPS for this trial.
+    max_interp_gap_frames = interp_gap_frames_from_fps(max_interp_gap_s, fps)
     window = kine_df.iloc[start_frame:stop_frame + 1]
     total_frames = len(window)
 
@@ -708,6 +708,7 @@ def _summarize_one_trial_keypoint(
         "QC_Error_Max": error_max,
         "QC_Score_Min": score_min,
         "QC_Min_Cameras": min_cameras,
+        "QC_Max_Interp_Gap_s": max_interp_gap_s,
         "QC_Max_Interp_Gap_Frames": max_interp_gap_frames,
         "QC_Max_Invalid_Fraction": max_invalid_fraction,
         "QC_Require_Score": bool(require_score),
@@ -761,7 +762,7 @@ def summarize_tracking_qc_by_trial_keypoint(
         error_max=50,
         score_min=0.8,
         min_cameras=2,
-        max_interp_gap_frames=5,
+        max_interp_gap_s=0.02,
         max_invalid_fraction=0.3,
         require_score=False,
         include_good_fly_only=True,
@@ -807,7 +808,7 @@ def summarize_tracking_qc_by_trial_keypoint(
                     error_max=error_max,
                     score_min=score_min,
                     min_cameras=min_cameras,
-                    max_interp_gap_frames=max_interp_gap_frames,
+                    max_interp_gap_s=max_interp_gap_s,
                     max_invalid_fraction=max_invalid_fraction,
                     require_score=require_score,
                 )
@@ -878,7 +879,7 @@ def plot_tracking_qc_summary(
         show=True,
         keypoint_order=None,
         max_invalid_fraction=None,
-        max_interp_gap_frames=None,
+        max_interp_gap_s=None,
         threshold_values=None,
         figsize=(11, 5),
 ):
@@ -894,8 +895,11 @@ def plot_tracking_qc_summary(
         keypoint_order = list(dict.fromkeys(qc_summary_df["Keypoint"]))
     if max_invalid_fraction is None:
         max_invalid_fraction = float(qc_summary_df["QC_Max_Invalid_Fraction"].dropna().iloc[0])
-    if max_interp_gap_frames is None:
-        max_interp_gap_frames = int(qc_summary_df["QC_Max_Interp_Gap_Frames"].dropna().iloc[0])
+    # The summary figure reports the interpolation setting in seconds, but the
+    # longest-gap panel uses each trial's effective frame cutoff.
+    if max_interp_gap_s is None:
+        max_interp_gap_s = float(qc_summary_df["QC_Max_Interp_Gap_s"].dropna().iloc[0])
+    max_interp_gap_frames = int(qc_summary_df["QC_Max_Interp_Gap_Frames"].dropna().median())
     if threshold_values is None:
         threshold_values = np.arange(0.05, 0.51, 0.05)
 
