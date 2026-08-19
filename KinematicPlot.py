@@ -27,7 +27,6 @@ import plot_angles as pa
 class PlotCreator:
     def __init__(self):
         self.calculator = ku.SimpleCalculation()
-        self.detector = ku.DetectCharacteristics()
         self.analyzer = ku.GroupDataAnalyzer()
 
         self.key_point_pairs = [
@@ -69,18 +68,6 @@ class PlotCreator:
             spine_width=spine_width,
             tick_width=tick_width
         )
-
-    def centered_shades(self, color, n_shades=5, spread=0.6):
-        return pc.centered_shades(color, n_shades=n_shades, spread=spread)
-
-    def _get_trial_meta(self, group_info, index):
-        return th.get_trial_metadata(group_info, index)
-
-    def _get_trial_obj(self, group_info, index):
-        return th.get_trial_object(group_info, index)
-
-    def _ensure_trials_loaded(self, group_info, trial_types=None):
-        return th.ensure_trials_loaded(group_info, trial_types=trial_types)
     
     def plot_TT_MOC_to_SLC_endpoint_projected_combined(
             self,
@@ -131,17 +118,6 @@ class PlotCreator:
         return pl.plot_LP_summary_from_groups(**locals())
     def plot_LP_summary_light_from_group(self, group_info, file_name, color):
         return pl.plot_LP_summary_light_from_group(**locals())
-    def plot_KM_curve(
-            self,
-            data_to_plot,
-            file_name,
-            colors=None,
-            linestyles=None,
-            markers=None,
-            opto=False,
-            marker_every=None
-    ):
-        return pl.plot_KM_curve(**locals())
     def plot_KM_curve_from_groups(
             self,
             groups,

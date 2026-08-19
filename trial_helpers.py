@@ -3,29 +3,6 @@
 import pandas as pd
 
 
-def trial_key(index):
-    """Return the standard metadata/kinematic dictionary key for an index."""
-    return f"F{index[0]}T{index[1]}"
-
-
-def get_trial_metadata(group_info, index):
-    return group_info.trial_metadata[trial_key(index)]
-
-
-def get_trial_object(group_info, index):
-    return group_info.fly_kinematic_data[trial_key(index)]
-
-
-def ensure_trials_loaded(group_info, trial_types=None):
-    """Initialize metadata when needed and load the requested trial types."""
-    if len(group_info.trial_metadata) == 0:
-        group_info.initialize_manual_data()
-
-    if trial_types is None:
-        trial_types = ["Landing", "Flying", "NF", "NA"]
-
-    group_info.read_kinematic_data(trial_types=trial_types)
-
 
 def is_successful_landing(meta, latency_threshold, allow_missing_sentinel=False):
     """Return whether metadata describes a landing within the threshold."""

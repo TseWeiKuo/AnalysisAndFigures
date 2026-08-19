@@ -22,78 +22,6 @@ class KinematicPath(str):
         obj.timestamp = timestamp
         return obj
 
-def group_files_by_fly(file_names):
-    """
-    Old filename parser.
-    Keep this for backward compatibility in case some older data folders still use
-    the old format.
-    """
-    pattern = re.compile(r"(\d{4}-\d{2}-\d{2})-\d{2}-\d{2}-\d{2}\.\d+.*?_Fly_(\d+)_Trial_(\d+)_")
-
-    unique_combinations = {}
-    grouped_files = {}
-    current_fly_number = 1
-
-    for file in file_names:
-        match = pattern.search(file)
-        if match:
-            date = match.group(1)
-            fly_number = match.group(2)
-            trial_number = match.group(3)
-            unique_fly_id = (date, fly_number)
-
-            if unique_fly_id not in unique_combinations:
-                unique_combinations[unique_fly_id] = current_fly_number
-                current_fly_number += 1
-
-            grouped_files[f"F{unique_combinations[unique_fly_id]}T{trial_number}"] = file
-
-    return grouped_files
-
-
-def group_files_by_fly_new(file_names):
-    """
-    New filename parser.
-
-    Supported examples:
-    1. 2025-10-20-13-42-48.38_..._Fly_5_Trial_1_.csv
-    2. 2025-1012-1312-43.06_..._Fly1_Trial1_.csv
-    """
-    pattern = re.compile(
-        r"(?P<date>\d{4}-(?:\d{2}-\d{2}|\d{4}))-"
-        r"(?P<time>\d{2}-\d{2}-\d{2}|\d{4}(?:-\d{2})?)"
-        r"(?:\.\d+)?"
-        r".*?"
-        r"_Fly_?(?P<fly>\d+)"
-        r"_Trial_?(?P<trial>\d+)_"
-    )
-
-    unique_combinations = {}
-    grouped_files = {}
-    current_fly_number = 1
-
-    for file_path in file_names:
-        file_name = os.path.basename(file_path)
-        match = pattern.search(file_name)
-
-        if not match:
-            print(f"Skipped (pattern not matched): {file_name}")
-            continue
-
-        date = match.group("date")
-        fly_number = match.group("fly")
-        trial_number = match.group("trial")
-        unique_fly_id = (date, fly_number)
-
-        if unique_fly_id not in unique_combinations:
-            unique_combinations[unique_fly_id] = current_fly_number
-            current_fly_number += 1
-
-        grouped_files[f"F{unique_combinations[unique_fly_id]}T{trial_number}"] = file_path
-
-    return grouped_files
-
-
 def parse_new_names(file_names):
     """
     Parser for reorganized kinematic CSV names generated from the video
@@ -161,7 +89,9 @@ def Get3D_path(source_folder, required=True):
     all_files = natsorted(all_files)
     grouped_data_path = parse_new_names(all_files)
     if len(grouped_data_path) == 0:
-        grouped_data_path = group_files_by_fly_new(all_files)
+        if not required:
+            return {}
+        raise FileNotFoundError(f"No kinematic CSV files found under: {source_folder}")
 
     if len(all_files) == 0:
         if not required:
@@ -663,84 +593,6 @@ class Group:
                 f"Missing kinematic CSVs for group {self.group_name}: {preview}{more}"
             )
 
-    def initialize_Chr_manual_data(self, require_kinematics=False):
-        """
-        Special initialization for Chr data where LL is often coded differently.
-        Metadata can be initialized without kinematic CSVs unless
-        require_kinematics=True.
-        """
-        if self.ll_data is None:
-            raise ValueError(f"LL data is required to initialize Chr group {self.group_name}.")
-        self.landing_trial_index = []
-        self.flying_trial_index = []
-        self.not_flying_trial_index = []
-        self.NA_trial_index = []
-        self.trial_metadata = dict()
-        missing_trials = []
-
-        for i in range(self.total_fly_number):
-            for t in range(self.trial_num):
-                fly = i + 1
-                trial = t + 1
-                key = self._trial_key(fly, trial)
-
-                path = None
-                light = None
-                if key in self.fly_kinematic_data_path:
-                    path = self.fly_kinematic_data_path[key]
-                    light = self._get_opto_label_from_path(path)
-                else:
-                    missing_trials.append(key)
-
-                trial_fps = self._resolve_trial_fps(fly, trial, path)
-
-                ll_val = self.ll_data.iloc[i, t]
-
-                if not isinstance(ll_val, str) and not pd.isna(ll_val) and ll_val >= 0:
-                    trial_type = "Landing"
-                    mol_val = ll_val
-                elif isinstance(ll_val, str) and ll_val == "NF":
-                    trial_type = "NF"
-                    mol_val = 100
-                elif ll_val == -1:
-                    trial_type = "Flying"
-                    mol_val = -1
-                elif pd.isna(ll_val):
-                    trial_type = "NA"
-                    mol_val = 100
-                else:
-                    trial_type = "Unknown"
-                    mol_val = np.nan
-
-                self.trial_metadata[key] = {
-                    "Fly#": fly,
-                    "Trial#": trial,
-                    "LL": ll_val,
-                    "MOC": np.nan,
-                    "MOL": mol_val,
-                    "fps": trial_fps,
-                    "TrialType": trial_type,
-                    "Path": path,
-                    "Light": light
-                }
-
-                idx = (fly, trial)
-                if trial_type == "Landing":
-                    self.landing_trial_index.append(idx)
-                elif trial_type == "Flying":
-                    self.flying_trial_index.append(idx)
-                elif trial_type == "NF":
-                    self.not_flying_trial_index.append(idx)
-                elif trial_type == "NA":
-                    self.NA_trial_index.append(idx)
-
-        if require_kinematics and missing_trials:
-            preview = ", ".join(missing_trials[:10])
-            more = "" if len(missing_trials) <= 10 else f" ... and {len(missing_trials) - 10} more"
-            raise FileNotFoundError(
-                f"Missing kinematic CSVs for Chr group {self.group_name}: {preview}{more}"
-            )
-
     # ------------------------------------------------------------
     # Kinematic loading
     # ------------------------------------------------------------
@@ -870,39 +722,6 @@ class Group:
     # ------------------------------------------------------------
     # Summary data
     # ------------------------------------------------------------
-
-    def get_LP(self):
-        """
-        Return landing probability per fly.
-        """
-        LP = []
-
-        for f in range(self.total_fly_number):
-            fly_num = f + 1
-
-            if fly_num not in self.good_fly_index:
-                continue
-
-            total = 0
-            land = 0
-
-            for ind in self.get_targeted_trials(["Landing", "Flying"]):
-                if ind[0] != fly_num:
-                    continue
-
-                key = self._trial_key(ind[0], ind[1])
-                meta = self.trial_metadata[key]
-
-                total += 1
-
-                if meta["TrialType"] == "Landing":
-                    if (meta["LL"] / meta["fps"]) <= self.latency_threshold:
-                        land += 1
-
-            if total > 0:
-                LP.append(land / total)
-
-        return LP
 
     def get_LP_df(self, group_name=None):
         """
@@ -1065,25 +884,3 @@ class Group:
                 OFF.append(ind)
 
         return ON, OFF
-
-    def get_SF_index(self):
-        """
-        Return success / failed trial indices.
-        """
-        Success = []
-        Failed = []
-
-        for ind in self.get_targeted_trials(["Landing", "Flying"]):
-            key = self._trial_key(ind[0], ind[1])
-            meta = self.trial_metadata[key]
-            ll = meta["LL"]
-            fps = meta["fps"]
-
-            if ll == -1:
-                Failed.append(ind)
-            elif (ll / fps) > self.latency_threshold:
-                Failed.append(ind)
-            else:
-                Success.append(ind)
-
-        return Success, Failed
