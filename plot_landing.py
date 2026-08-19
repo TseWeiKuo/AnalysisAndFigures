@@ -476,7 +476,6 @@ def plot_it_ot_landing_probability_and_latency(
         angle_end_s=0.1,
         target_fps=200,
         min_angle_frames=3,
-        use_absolute_angular_velocity=True,
         colors=None,
         apply_tracking_qc=False,
         min_cameras=2,
@@ -576,12 +575,11 @@ def plot_it_ot_landing_probability_and_latency(
     if not np.any(baseline_mask):
         raise ValueError("The angle trace window must include pre-MOC samples for baseline correction.")
 
-    # Collect trial-level landing outcomes, angle traces, velocity summaries,
-    # and optional tracking-QC diagnostics in separate row lists. They become
-    # DataFrames after the trial loop.
+    # Collect trial-level landing outcomes, angle traces, and optional
+    # tracking-QC diagnostics in separate row lists. They become DataFrames
+    # after the trial loop.
     trial_rows = []
     angle_trace_rows = []
-    angular_velocity_rows = []
     angle_qc_rows = []
     angle_skipped_rows = []
     for index in group_info.get_targeted_trials(list(trial_types)):
@@ -757,8 +755,8 @@ def plot_it_ot_landing_probability_and_latency(
             })
             continue
 
-        # Enforce a minimum number of valid samples so interpolation and
-        # velocity calculations are not based on an underdetermined trace.
+        # Enforce a minimum number of valid samples so interpolation is not
+        # based on an underdetermined trace.
         if np.sum(valid) < min_angle_frames:
             angle_skipped_rows.append({
                 "Group_Name": group_info.group_name,
@@ -822,40 +820,12 @@ def plot_it_ot_landing_probability_and_latency(
                 "Smooth_Alpha": smooth_alpha if smooth_angle else np.nan,
             })
 
-        # Summarize angular velocity in the original sampled window. The
-        # absolute-value option reports speed regardless of movement direction.
-        clean_angle = source_trace[valid]
-        angular_velocity = np.diff(clean_angle) * fps
-        if use_absolute_angular_velocity:
-            angular_velocity = np.abs(angular_velocity)
-        if len(angular_velocity) == 0:
-            continue
-        angular_velocity_rows.append({
-            "Group_Name": group_info.group_name,
-            "Index": str(index),
-            "Fly#": index[0],
-            "Trial#": index[1],
-            "Behavior_Label": behavior_label,
-            "Behavior_Display": behavior_display_names.get(behavior_label, behavior_label),
-            "Contacted_Leg": contacted_leg,
-            "Joint": angle_def[1],
-            "Mean_Angular_Velocity_deg_s": float(np.nanmean(angular_velocity)),
-            "Angle_Start_s": angle_start_s,
-            "Angle_End_s": angle_end_s,
-            "Use_Absolute_Angular_Velocity": use_absolute_angular_velocity,
-            "Apply_Tracking_QC": apply_tracking_qc,
-            "Smooth_Angle": smooth_angle,
-            "Smooth_Method": smooth_method if smooth_angle else "",
-            "Smooth_Alpha": smooth_alpha if smooth_angle else np.nan,
-        })
-
     # Materialize all collected rows as DataFrames. The trial table is required;
     # angle-related tables may be empty if traces were missing or filtered out.
     trial_df = pd.DataFrame(trial_rows)
     if trial_df.empty:
         raise ValueError("No IT/OT-labeled Landing/Flying trials were found.")
     angle_trace_df = pd.DataFrame(angle_trace_rows)
-    angular_velocity_df = pd.DataFrame(angular_velocity_rows)
     angle_qc_df = pd.DataFrame(angle_qc_rows)
     angle_skipped_df = pd.DataFrame(angle_skipped_rows)
 
@@ -918,8 +888,6 @@ def plot_it_ot_landing_probability_and_latency(
         stat_df.to_csv(f"{file_name}_permutation_stats.csv", index=False)
         if not angle_trace_df.empty:
             angle_trace_df.to_csv(f"{file_name}_FT_angle_traces.csv", index=False)
-        if not angular_velocity_df.empty:
-            angular_velocity_df.to_csv(f"{file_name}_FT_angular_velocity.csv", index=False)
         if apply_tracking_qc:
             angle_qc_df.to_csv(f"{file_name}_FT_angle_qc_summary.csv", index=False)
             angle_skipped_df.to_csv(f"{file_name}_FT_angle_qc_skipped_trials.csv", index=False)
@@ -1183,6 +1151,6 @@ def plot_it_ot_landing_probability_and_latency(
     return (
         fig_lp, ax_lp, fig_km, ax_km, fig_angle, ax_angle,
         fly_lp_df, trial_df, stat_df, km_stat_df, logrank_df,
-        angle_trace_df, angular_velocity_df,
+        angle_trace_df,
     )
 

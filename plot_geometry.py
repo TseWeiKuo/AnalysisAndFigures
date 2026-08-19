@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import linregress
+from scipy.stats import spearmanr
 
 import plot_common as pc
 import tracking_qc as tqc
@@ -132,6 +132,27 @@ def _calculate_tt_metrics(tt_xyz, fps, min_frames=3, min_path_length=1e-6):
         else np.nan
     )
     return average_speed, path_efficiency, path_length, displacement, duration_s
+
+
+def _calculate_tt_path_efficiency(tt_xyz, min_frames=3, min_path_length=1e-6):
+    """Calculate only the straight-line displacement divided by path length."""
+    # Drop frames with any non-finite coordinate before measuring the TT path.
+    tt_xyz = np.asarray(tt_xyz, dtype=float)
+    valid = np.all(np.isfinite(tt_xyz), axis=1)
+    tt_xyz = tt_xyz[valid]
+    # A trajectory needs enough finite samples to define a meaningful path.
+    if len(tt_xyz) < min_frames:
+        return np.nan
+
+    # Path length is required as the denominator of path efficiency.
+    steps = np.diff(tt_xyz, axis=0)
+    path_length = np.sum(np.linalg.norm(steps, axis=1))
+    if path_length <= min_path_length:
+        return np.nan
+
+    # Displacement is the straight-line start-to-end distance.
+    displacement = np.linalg.norm(tt_xyz[-1] - tt_xyz[0])
+    return displacement / path_length
 
 
 def _empty_qc_summary():
@@ -1204,7 +1225,6 @@ def plot_TT_MOC_to_SLC_endpoint_projected_combined(
 def plot_left_TT_path_efficiency_grouped_stripplots(
         self,
         group_info,
-        behavior_sources,
         file_name="left_TT_path_efficiency_grouped_stripplots",
         legs=("L-f", "L-m", "L-h"),
         trial_types=("Landing", "Flying"),
@@ -1226,11 +1246,7 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         require_score=False
 ):
     """
-    Plot left-leg TT path efficiency grouped by outcome and IT/OT behavior.
-
-    Figure layout:
-    - top panel: Success vs Failed within each leg
-    - bottom panel: Inward touch vs Outward touch within each leg
+    Plot left-leg TT path efficiency grouped by landing outcome.
 
     Window modes match plot_TT_summary_metrics_vs_LL:
     - fixed: MOC -> MOC + trajectory_window_s
@@ -1249,19 +1265,12 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     else:
         legs = tuple(legs)
 
-    # Default colors distinguish landing outcome and behavior category.
+    # Default colors distinguish landing outcome only.
     if colors is None:
         colors = {
             "Success": "tab:blue",
             "Failed": "tab:red",
-            "IT": "#8FD694",
-            "OT": "#C7A0E8",
         }
-
-    behavior_display_names = {
-        "IT": "Inward touch",
-        "OT": "Outward touch",
-    }
 
     # Load metadata and kinematic traces only if the caller has not already done
     # so in a notebook or upstream script.
@@ -1276,13 +1285,6 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
     sc_lookup = {}
     if trajectory_window_mode == "SLC_adjusted":
         sc_lookup = _load_sc_lookup(self.calculator, sc_csv_path, legs)
-
-    # Convert IT/OT behavior annotations into a trial-index lookup.
-    behavior_trial_sets = th.trial_sets_from_behavior_sources(behavior_sources)
-    behavior_by_index = {}
-    for behavior_label, indexes in behavior_trial_sets.items():
-        for index in indexes:
-            behavior_by_index[tuple(index)] = behavior_label
 
     # Collect one path-efficiency row per valid trial and leg. QC failures are
     # tracked separately so they can be exported when tracking QC is enabled.
@@ -1309,12 +1311,6 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
 
         moc_i = int(moc)
         outcome = th.classify_landing(meta, group_info.latency_threshold)
-        behavior_label = behavior_by_index.get(tuple(index))
-        behavior_display = (
-            behavior_display_names.get(behavior_label, behavior_label)
-            if behavior_label is not None
-            else np.nan
-        )
 
         for leg in legs:
             # Build the TT keypoint name for this leg, such as L-mTT.
@@ -1415,8 +1411,6 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
                 "Trial#": index[1],
                 "Leg": leg,
                 "Outcome": outcome,
-                "Behavior_Label": behavior_label,
-                "Behavior_Display": behavior_display,
                 "TrialType": meta["TrialType"],
                 "Landing_Latency_s": ll_s,
                 "LL_frame": meta["LL"],
@@ -1495,7 +1489,8 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
         row["significance"] = significance_label(p_value)
         return row
 
-    # First compare landing outcomes for each leg.
+    # Compare landing outcomes for each leg; no behavior-label statistics are
+    # calculated in this outcome-only plotting function.
     stat_rows = []
     for leg in legs:
         stat_rows.append(run_unpaired_test(
@@ -1506,21 +1501,6 @@ def plot_left_TT_path_efficiency_grouped_stripplots(
             "Failed",
             "success_vs_failed"
         ))
-
-    # Then compare IT/OT behavior groups when at least two behavior labels are
-    # available in behavior_sources.
-    behavior_df = path_df.dropna(subset=["Behavior_Label"]).copy()
-    behavior_keys = list(behavior_sources.keys())
-    if len(behavior_keys) >= 2:
-        for leg in legs:
-            stat_rows.append(run_unpaired_test(
-                behavior_df,
-                leg,
-                "Behavior_Label",
-                behavior_keys[0],
-                behavior_keys[1],
-                "behavior_group"
-            ))
 
     stat_df = pd.DataFrame(stat_rows)
 
@@ -1600,8 +1580,6 @@ def plot_TT_summary_metrics_vs_LL(
         sc_csv_path=None,
         file_name="TT_summary_metrics_vs_LL",
         save_csv=True,
-        n_perm=20000,
-        random_state=0,
         apply_tracking_qc=False,
         min_cameras=2,
         max_interp_gap_s=0.02,
@@ -1613,18 +1591,14 @@ def plot_TT_summary_metrics_vs_LL(
     """
     Plot L-hTT path efficiency vs landing latency.
 
-    The figure reports trial-level Spearman correlation and fly-average
-    Spearman correlation. Permutation p-values are computed by shuffling the
-    y-values and recalculating Spearman rho.
+    The figure reports the trial-level Spearman correlation between landing
+    latency and the plotted path-efficiency metric.
     """
     if isinstance(leg, str):
         target_leg = leg
     else:
         target_leg = tuple(leg)[0]
 
-    # Use a local RNG so permutation tests are reproducible and do not affect
-    # other random operations in the notebook/session.
-    rng = np.random.default_rng(random_state)
     # Build the QC metadata helper from the current fixed-threshold,
     # time-based interpolation rule.
     qc_config = tqc.build_config(
@@ -1751,17 +1725,16 @@ def plot_TT_summary_metrics_vs_LL(
             end = min(end_frame + 1, len(tt_xyz))
             tt_seg = tt_xyz[moc_i:end]
 
-            # Calculate the three plotted metrics plus supporting displacement
-            # and duration values.
-            average_speed, path_efficiency, path_length, displacement, duration_s = _calculate_tt_metrics(
+            # Calculate only the path-efficiency metric used by this plot.
+            path_efficiency = _calculate_tt_path_efficiency(
                 tt_seg,
-                fps,
                 min_frames=min_frames,
                 min_path_length=min_path_length
             )
-            if all(pd.isna(value) for value in (average_speed, path_efficiency, path_length)):
-                # Metric calculation can fail if too few finite coordinates
-                # remain. Preserve this as a QC diagnostic when QC is enabled.
+            if pd.isna(path_efficiency):
+                # Path-efficiency calculation can fail if too few finite
+                # coordinates remain. Preserve this as a QC diagnostic when QC
+                # is enabled.
                 if apply_tracking_qc:
                     qc_skipped_rows.append({
                         "Group_Name": group_info.group_name,
@@ -1771,7 +1744,7 @@ def plot_TT_summary_metrics_vs_LL(
                         "Leg": leg,
                         "Keypoint": point_name,
                         "Outcome": outcome,
-                        "Reason": "TT summary metrics unavailable after tracking QC",
+                        "Reason": "TT path efficiency unavailable after tracking QC",
                         "Analysis_Window_Start_Frame": moc_i,
                         "Analysis_Window_End_Frame": end_frame,
                         **qc_summary,
@@ -1793,11 +1766,7 @@ def plot_TT_summary_metrics_vs_LL(
                 "LL_frame": meta["LL"],
                 "Landing_Latency_Censored": ll_censored,
                 "Landing_Latency_Source": ll_source,
-                "TT_Average_Speed": average_speed,
                 "TT_Path_Efficiency": path_efficiency,
-                "TT_Path_Length": path_length,
-                "TT_Displacement": displacement,
-                "Window_Duration_s": duration_s,
                 "Trajectory_Window_Mode": trajectory_window_mode,
                 "Analysis_Window_Rule": window_rule,
                 "Analysis_Window_Start_Frame": moc_i,
@@ -1821,15 +1790,8 @@ def plot_TT_summary_metrics_vs_LL(
         return None, None, metric_df, pd.DataFrame()
 
 
-    # Compute correlations for the single requested L-hTT path-efficiency panel.
+    # Compute one Spearman correlation for the plotted trial-level points.
     clean = metric_df[["Landing_Latency_s", y_col]].dropna()
-    fly_average_clean = (
-        metric_df
-        .groupby("Fly#")[["Landing_Latency_s", y_col]]
-        .mean()
-        .dropna()
-        .reset_index()
-    )
     stat_row = {
         "Group_Name": group_info.group_name,
         "Leg": target_leg,
@@ -1838,52 +1800,19 @@ def plot_TT_summary_metrics_vs_LL(
         "n": len(clean),
         "spearman_rho": np.nan,
         "spearman_p": np.nan,
-        "spearman_permutation_p": np.nan,
-        "fly_average_n": len(fly_average_clean),
-        "fly_average_spearman_rho": np.nan,
-        "fly_average_spearman_p": np.nan,
-        "fly_average_spearman_permutation_p": np.nan,
-        "linear_slope": np.nan,
-        "linear_intercept": np.nan,
-        "linear_r": np.nan,
-        "linear_p": np.nan,
-        "n_perm": n_perm,
         "Trajectory_Window_Mode": trajectory_window_mode,
     }
 
     if len(clean) >= 3 and clean["Landing_Latency_s"].nunique() >= 2 and clean[y_col].nunique() >= 2:
-        spearman_rho, spearman_p, spearman_perm_p = self.calculator.spearman_permutation_test(
+        # Use scipy's standard Spearman test directly; no permutation or
+        # fly-average correlation is calculated in this plotting function.
+        spearman_rho, spearman_p = spearmanr(
             clean["Landing_Latency_s"],
-            clean[y_col],
-            n_perm=n_perm,
-            rng=rng
-        )
-        linear = linregress(clean["Landing_Latency_s"], clean[y_col])
-        stat_row.update({
-            "spearman_rho": spearman_rho,
-            "spearman_p": spearman_p,
-            "spearman_permutation_p": spearman_perm_p,
-            "linear_slope": float(linear.slope),
-            "linear_intercept": float(linear.intercept),
-            "linear_r": float(linear.rvalue),
-            "linear_p": float(linear.pvalue),
-        })
-
-    if (
-            len(fly_average_clean) >= 3
-            and fly_average_clean["Landing_Latency_s"].nunique() >= 2
-            and fly_average_clean[y_col].nunique() >= 2
-    ):
-        fly_rho, fly_p, fly_perm_p = self.calculator.spearman_permutation_test(
-            fly_average_clean["Landing_Latency_s"],
-            fly_average_clean[y_col],
-            n_perm=n_perm,
-            rng=rng
+            clean[y_col]
         )
         stat_row.update({
-            "fly_average_spearman_rho": fly_rho,
-            "fly_average_spearman_p": fly_p,
-            "fly_average_spearman_permutation_p": fly_perm_p,
+            "spearman_rho": float(spearman_rho),
+            "spearman_p": float(spearman_p),
         })
 
     stat_df = pd.DataFrame([stat_row])
@@ -1923,48 +1852,13 @@ def plot_TT_summary_metrics_vs_LL(
         alpha=0.75,
         ax=ax
     )
-    if not fly_average_clean.empty:
-        ax.scatter(
-            fly_average_clean["Landing_Latency_s"],
-            fly_average_clean[y_col],
-            color="black",
-            marker="D",
-            s=52,
-            edgecolor="white",
-            linewidth=0.5,
-            zorder=5,
-            label="Fly average"
-        )
-        if (
-                len(fly_average_clean) >= 3
-                and fly_average_clean["Landing_Latency_s"].nunique() >= 2
-                and fly_average_clean[y_col].nunique() >= 2
-        ):
-            fit = linregress(fly_average_clean["Landing_Latency_s"], fly_average_clean[y_col])
-            x_fit = np.linspace(
-                fly_average_clean["Landing_Latency_s"].min(),
-                fly_average_clean["Landing_Latency_s"].max(),
-                100
-            )
-            ax.plot(
-                x_fit,
-                fit.intercept + fit.slope * x_fit,
-                color="black",
-                linewidth=1.6,
-                alpha=0.85,
-                label="Fly-average linear fit"
-            )
 
     rho = stat_df.iloc[0]["spearman_rho"]
-    p_value = stat_df.iloc[0]["spearman_permutation_p"]
+    p_value = stat_df.iloc[0]["spearman_p"]
     n_points = int(stat_df.iloc[0]["n"])
-    fly_rho = stat_df.iloc[0]["fly_average_spearman_rho"]
-    fly_p_value = stat_df.iloc[0]["fly_average_spearman_permutation_p"]
-    fly_n = int(stat_df.iloc[0]["fly_average_n"])
-    stat_label = (
-        f"trial n={n_points}, {pc.format_rho_value(rho)}, perm {pc.format_p_value(p_value)}\n"
-        f"fly n={fly_n}, {pc.format_rho_value(fly_rho)}, perm {pc.format_p_value(fly_p_value)}"
-    )
+    # The title reports only the Spearman statistic that corresponds to the
+    # plotted trial-level scatter points.
+    stat_label = f"n={n_points}, {pc.format_rho_value(rho)}, {pc.format_p_value(p_value)}"
 
     ax.axvline(group_info.latency_threshold, color="black", linestyle="--", linewidth=1)
     ax.set_title(f"{target_leg}TT {metric_title}\n{stat_label}")

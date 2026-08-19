@@ -37,10 +37,10 @@ def plot_selected_chrimson_angle_traces(
         qc_end=2.0
 ):
     """
-    Plot selected CsChrimson ON angle traces in one panel.
+    Plot selected CsChrimson angle traces with one subplot per angle.
 
-    The first angle definition is plotted as a solid leg-angle trace, and
-    the second angle definition is plotted as a dashed wing-angle trace.
+    Each angle definition is plotted on its own row, so callers can request
+    only R-mFT or pass multiple definitions when needed.
     """
     if isinstance(groups, dict):
         group_items = list(groups.items())
@@ -51,15 +51,20 @@ def plot_selected_chrimson_angle_traces(
         angles = [
             ["R-mCT", "R-mFT", "R-mTT"],
         ]
-    if len(angles) < 2:
-        raise ValueError("Provide at least two angle definitions: leg angle and wing angle.")
+    # Normalize and validate the requested angle definitions before plotting.
+    if len(angles) < 1:
+        raise ValueError("Provide at least one angle definition.")
 
     if colors is None:
         colors = sns.color_palette("tab10", len(group_items))
 
     condition = str(condition).upper()
     frames = np.arange(int(start * 250), int(end * 250)) / 250
-    fig, axes = plt.subplots(2, 1, figsize=(7.0, 7.0), sharex=True)
+    # Build one row per requested angle, including the single-angle R-mFT case.
+    n_angles = len(angles)
+    fig_height = max(3.4, 2.8 * n_angles)
+    fig, axes = plt.subplots(n_angles, 1, figsize=(7.0, fig_height), sharex=True)
+    axes = np.atleast_1d(axes)
     stat_rows = []
     qc_rows = []
     skipped_rows = []
@@ -116,7 +121,8 @@ def plot_selected_chrimson_angle_traces(
             group_data = angle_result
 
         color = colors[group_idx % len(colors)]
-        for angle_idx, angle_def in enumerate(angles[:2]):
+        # Plot every requested angle instead of assuming a fixed leg/wing pair.
+        for angle_idx, angle_def in enumerate(angles):
             ax = axes[angle_idx]
             joint_name = angle_def[1]
             traces = group_data.get(joint_name, [])
@@ -136,8 +142,9 @@ def plot_selected_chrimson_angle_traces(
                     / np.sqrt(valid_n[valid_sem])
             )
 
-            line_style = "solid" if angle_idx == 0 else "dashed"
-            trace_label = "leg angle" if angle_idx == 0 else "wing angle"
+            # Keep line style stable across panels; panel labels identify joints.
+            line_style = "solid"
+            trace_label = joint_name
             ax.plot(
                 frames[:len(mean_trace)],
                 mean_trace,
@@ -172,26 +179,27 @@ def plot_selected_chrimson_angle_traces(
                 "Apply_Tracking_QC": bool(apply_tracking_qc),
             })
 
-    from matplotlib.lines import Line2D
-    style_handles = [
-        Line2D([0], [0], color="black", linestyle="solid", linewidth=2.2, label="solid = leg angle"),
-        Line2D([0], [0], color="black", linestyle="dashed", linewidth=2.2, label="dashed = wing angle"),
-    ]
     for axis_idx, ax in enumerate(axes):
+        # Mark light-on and the 2 s reference used in the CsChrimson analysis.
         ax.axvline(0, color="black", linestyle="--", linewidth=1.2)
         ax.axvline(2, color="black", linestyle="--", linewidth=1.2)
         ax.set_xlim(start, end)
-        ax.set_ylabel("Leg angle (deg)" if axis_idx == 0 else "Wing angle (deg)")
+        ax.set_ylabel(f"{angles[axis_idx][1]} angle (deg)")
         self.formatting(
             ax,
             xticks=[start, 0, 2, end],
-            xlabel="Time from light ON (s)" if axis_idx == 1 else None
+            xlabel="Time from light ON (s)" if axis_idx == n_angles - 1 else None
         )
-    axes[0].set_title(f"Selected CsChrimson {condition} leg and wing angle traces")
+    # Use a specific single-angle title, otherwise keep a generic angle-trace title.
+    if n_angles == 1:
+        axes[0].set_title(f"Selected CsChrimson {condition} {angles[0][1]} angle traces")
+    else:
+        axes[0].set_title(f"Selected CsChrimson {condition} angle traces")
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
-        ax.legend(handles=handles + style_handles, labels=labels + [handle.get_label() for handle in style_handles],
-                  frameon=True, fontsize=7, loc="upper right")
+        # Keep legends limited to plotted groups; style legends are unnecessary
+        # once each angle has its own panel.
+        ax.legend(handles=handles, labels=labels, frameon=True, fontsize=7, loc="upper right")
     sns.despine(trim=True)
     plt.tight_layout()
 
