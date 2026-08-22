@@ -27,8 +27,6 @@ import plot_angles as pa
 class PlotCreator:
     def __init__(self):
         self.calculator = ku.SimpleCalculation()
-        self.analyzer = ku.GroupDataAnalyzer()
-
         self.key_point_pairs = [
             ["L-wing", "L-wing-hinge"],
             ["R-wing", "R-wing-hinge"],

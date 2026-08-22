@@ -12,8 +12,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from scipy.stats import spearmanr
-
-import plot_common as pc
 import tracking_qc as tqc
 import trial_helpers as th
 
@@ -1858,7 +1856,21 @@ def plot_TT_summary_metrics_vs_LL(
     n_points = int(stat_df.iloc[0]["n"])
     # The title reports only the Spearman statistic that corresponds to the
     # plotted trial-level scatter points.
-    stat_label = f"n={n_points}, {pc.format_rho_value(rho)}, {pc.format_p_value(p_value)}"
+    
+    def format_p_value(p_value):
+        if pd.isna(p_value):
+            return "p=NA"
+        if p_value < 0.001:
+            return "p<0.001"
+        return f"p={p_value:.3f}"
+
+
+    def format_rho_value(rho):
+        if pd.isna(rho):
+            return "rho=NA"
+        return f"rho={rho:.2f}"
+    
+    stat_label = f"n={n_points}, {format_rho_value(rho)}, {format_p_value(p_value)}"
 
     ax.axvline(group_info.latency_threshold, color="black", linestyle="--", linewidth=1)
     ax.set_title(f"{target_leg}TT {metric_title}\n{stat_label}")

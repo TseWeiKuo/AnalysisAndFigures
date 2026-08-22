@@ -69,6 +69,191 @@ def plot_selected_chrimson_angle_traces(
     qc_rows = []
     skipped_rows = []
 
+    def collect_chrimson_angle_traces(group_info, index_to_iterate):
+        # Collect CsChrimson traces locally so this plot no longer depends on
+        # GroupDataAnalyzer.Calculate_angle_traces as a second angle pipeline.
+        collected_data = {angle_def[1]: [] for angle_def in angles}
+        group_qc_rows = []
+        group_skipped_rows = []
+
+        for index in index_to_iterate:
+            # Resolve the loaded Trial object using the same fly/trial key as
+            # the rest of the repository's plotting code.
+            key = group_info._trial_key(index[0], index[1])
+            if key not in group_info.fly_kinematic_data:
+                group_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Reason": "missing kinematic data",
+                    "Alignment_Frame": 750,
+                })
+                continue
+
+            trial_info = group_info.fly_kinematic_data[key]
+            alignment_frame = 750
+            if pd.isna(trial_info.fps):
+                group_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Reason": "missing fps",
+                    "Alignment_Frame": alignment_frame,
+                })
+                continue
+
+            # Convert requested trace and QC windows from seconds after light ON
+            # into absolute frame coordinates in the native trial FPS.
+            trace_start = int(round(alignment_frame + start * trial_info.fps))
+            trace_end = int(round(alignment_frame + end * trial_info.fps))
+            qc_window_start_s = start if qc_start is None else qc_start
+            qc_window_end_s = end if qc_end is None else qc_end
+            qc_start_frame = (
+                int(round(alignment_frame + qc_window_start_s * trial_info.fps))
+                if apply_tracking_qc else None
+            )
+            qc_end_frame = (
+                int(round(alignment_frame + qc_window_end_s * trial_info.fps)) - 1
+                if apply_tracking_qc else None
+            )
+
+            # Skip incomplete trace windows so group means have consistent time
+            # support and do not depend on partial edge slices.
+            if trace_start < 0 or trace_end > trial_info.total_frames_number:
+                group_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Reason": "incomplete light-aligned window",
+                    "Alignment_Frame": alignment_frame,
+                    "Trace_Start_Frame": trace_start,
+                    "Trace_End_Frame": trace_end - 1,
+                })
+                continue
+            missing_points = [
+                point
+                for angle_def in angles
+                for point in angle_def
+                if point not in trial_info.trial_data
+            ]
+            if missing_points:
+                group_skipped_rows.append({
+                    "Group_Name": group_info.group_name,
+                    "Index": str(index),
+                    "Fly#": index[0],
+                    "Trial#": index[1],
+                    "Reason": "missing angle keypoint",
+                    "Missing_Keypoints": "|".join(sorted(set(missing_points))),
+                    "Alignment_Frame": alignment_frame,
+                })
+                continue
+
+            # Use the shared low-level angle calculator so CsChrimson and WT
+            # angle plots pass through the same QC/interpolation implementation.
+            angle_result = self.calculator.Calculate_joint_angle(
+                trial_info,
+                angles,
+                apply_tracking_qc=apply_tracking_qc,
+                min_cameras=min_cameras,
+                max_interp_gap_s=max_interp_gap_s,
+                min_valid_fraction=min_valid_fraction,
+                error_max=error_max,
+                score_min=score_min,
+                require_score=require_score,
+                smooth_angle=smooth_angle,
+                smooth_window_frames=smooth_window_frames,
+                smooth_polyorder=smooth_polyorder,
+                qc_start=qc_start_frame,
+                qc_end=qc_end_frame,
+                return_qc=apply_tracking_qc
+            )
+            if apply_tracking_qc:
+                angle_data, trial_qc_df = angle_result
+                if not trial_qc_df.empty:
+                    trial_qc_df = trial_qc_df.copy()
+                    trial_qc_df["Index"] = str(index)
+                    trial_qc_df["Fly#"] = index[0]
+                    trial_qc_df["Trial#"] = index[1]
+                    trial_qc_df["Group_Name"] = group_info.group_name
+                    group_qc_rows.extend(trial_qc_df.to_dict("records"))
+            else:
+                angle_data = angle_result
+
+            for angle_def in angles:
+                joint_name = angle_def[1]
+                joint_signal = np.asarray(angle_data[joint_name][trace_start:trace_end], dtype=float)
+
+                if apply_tracking_qc:
+                    # Re-check the exact plotted window after interpolation so
+                    # traces with excessive invalid burden are excluded.
+                    max_interp_gap_frames = tqc.interp_gap_frames_from_fps(
+                        max_interp_gap_s,
+                        trial_info.fps
+                    )
+                    qc_trace_start = max(qc_start_frame, trace_start)
+                    qc_trace_end = min(qc_end_frame + 1, trace_end)
+                    qc_start_offset = max(qc_trace_start - trace_start, 0)
+                    qc_end_offset = max(qc_trace_end - trace_start, qc_start_offset)
+                    qc_signal = joint_signal[qc_start_offset:qc_end_offset]
+                    window_valid = np.isfinite(qc_signal)
+                    window_valid_fraction = float(np.mean(window_valid)) if len(window_valid) else np.nan
+                    window_gaps = self.calculator.invalid_gap_lengths(window_valid) if len(window_valid) else []
+                    max_window_gap = int(max(window_gaps)) if window_gaps else 0
+                    finite_count = int(np.sum(window_valid))
+
+                    # Convert each failed plotted-window rule into an explicit
+                    # skipped-row reason for downstream inspection.
+                    skip_reason = ""
+                    if pd.isna(window_valid_fraction):
+                        skip_reason = "empty plotted window"
+                    elif window_valid_fraction < min_valid_fraction:
+                        skip_reason = "valid_fraction_below_threshold"
+                    elif max_window_gap > max_interp_gap_frames:
+                        skip_reason = "long_invalid_gap"
+                    elif finite_count < 2:
+                        skip_reason = "fewer_than_two_finite_frames"
+                    if skip_reason:
+                        group_skipped_rows.append({
+                            "Group_Name": group_info.group_name,
+                            "Index": str(index),
+                            "Fly#": index[0],
+                            "Trial#": index[1],
+                            "Joint": joint_name,
+                            "Angle_Definition": "|".join(angle_def),
+                            "Reason": skip_reason,
+                            "Alignment_Frame": alignment_frame,
+                            "Trace_Start_Frame": trace_start,
+                            "Trace_End_Frame": trace_end - 1,
+                            "QC_Start_Frame": qc_trace_start,
+                            "QC_End_Frame": qc_trace_end - 1,
+                            "Requested_Start_s": start,
+                            "Requested_End_s": end,
+                            "QC_Start_s": qc_window_start_s,
+                            "QC_End_s": qc_window_end_s,
+                            "Window_Frame_Count": int(len(qc_signal)),
+                            "Finite_Frame_Count": finite_count,
+                            "Window_Valid_Frame_Fraction": window_valid_fraction,
+                            "Window_Max_Invalid_Gap_Frames": max_window_gap,
+                            "Min_Valid_Fraction": min_valid_fraction,
+                            "Max_Interp_Gap_s": max_interp_gap_s,
+                            "Max_Interp_Gap_Frames": max_interp_gap_frames,
+                            "Min_Cameras": min_cameras,
+                        })
+                        continue
+
+                # Preserve the previous 200 FPS normalization behavior while
+                # avoiding the removed higher-level angle-trace collector.
+                if trial_info.fps == 200:
+                    target_len = int(round((end - start) * 250))
+                    joint_signal = self.calculator.Normalized_time(joint_signal, target_len)
+
+                collected_data[joint_name].append(joint_signal)
+
+        return collected_data, pd.DataFrame(group_qc_rows), pd.DataFrame(group_skipped_rows)
+
     for group_idx, (group_label, group_info) in enumerate(group_items):
         if len(group_info.trial_metadata) == 0:
             group_info.initialize_manual_data()
@@ -82,43 +267,24 @@ def plot_selected_chrimson_angle_traces(
             print(f"No {condition} trials found for {group_info.group_name}")
             continue
 
-        angle_result = self.analyzer.Calculate_angle_traces(
-            group_info=group_info,
-            index_to_iterate=index_to_iterate,
-            angles=angles,
-            start=start,
-            end=end,
-            chrimson=True,
-            apply_tracking_qc=apply_tracking_qc,
-            min_cameras=min_cameras,
-            max_interp_gap_s=max_interp_gap_s,
-            min_valid_fraction=min_valid_fraction,
-            # Forward the current fixed-threshold QC rule instead of relying on
-            # calculator defaults when optogenetic angle QC is enabled.
-            error_max=error_max,
-            score_min=score_min,
-            require_score=require_score,
-            smooth_angle=smooth_angle,
-            smooth_window_frames=smooth_window_frames,
-            smooth_polyorder=smooth_polyorder,
-            qc_start=qc_start,
-            qc_end=qc_end,
-            return_qc=apply_tracking_qc
+        group_data, group_qc_df, group_skipped_df = collect_chrimson_angle_traces(
+            group_info,
+            index_to_iterate
         )
-        if apply_tracking_qc:
-            group_data, group_qc_df, group_skipped_df = angle_result
-            if not group_qc_df.empty:
-                group_qc_df = group_qc_df.copy()
-                group_qc_df["Plot_Label"] = group_label
-                group_qc_df["Condition"] = condition
-                qc_rows.extend(group_qc_df.to_dict("records"))
-            if not group_skipped_df.empty:
-                group_skipped_df = group_skipped_df.copy()
-                group_skipped_df["Plot_Label"] = group_label
-                group_skipped_df["Condition"] = condition
-                skipped_rows.extend(group_skipped_df.to_dict("records"))
-        else:
-            group_data = angle_result
+        if apply_tracking_qc and not group_qc_df.empty:
+            # Add plot-level labels after collection so the lower-level QC rows
+            # remain reusable and group-specific.
+            group_qc_df = group_qc_df.copy()
+            group_qc_df["Plot_Label"] = group_label
+            group_qc_df["Condition"] = condition
+            qc_rows.extend(group_qc_df.to_dict("records"))
+        if apply_tracking_qc and not group_skipped_df.empty:
+            # Keep skipped-trial diagnostics aligned with the selected plot
+            # group and light condition.
+            group_skipped_df = group_skipped_df.copy()
+            group_skipped_df["Plot_Label"] = group_label
+            group_skipped_df["Condition"] = condition
+            skipped_rows.extend(group_skipped_df.to_dict("records"))
 
         color = colors[group_idx % len(colors)]
         # Plot every requested angle instead of assuming a fixed leg/wing pair.
