@@ -1,10 +1,6 @@
 """Configuration helpers shared by tracking-QC-aware plotting workflows."""
 
 from dataclasses import dataclass
-from pathlib import Path
-
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator
 import numpy as np
 import pandas as pd
 
@@ -17,7 +13,7 @@ class TrackingQCConfig:
     enabled: bool = False
     # Reprojection-error cutoff used to mark a frame invalid.
     error_max: float = 50
-    # Minimum accepted score/likelihood when a score column is available.
+    # Minimum accepted score for the required PointName_score channel.
     score_min: float = 0.8
     # Minimum number of cameras contributing to the reconstructed 3D point.
     min_cameras: int = 2
@@ -25,8 +21,6 @@ class TrackingQCConfig:
     max_interp_gap_s: float = 0.02
     # Minimum fraction of valid frames required within the analysis window.
     min_valid_fraction: float = 0.7
-    # If True, a missing score/likelihood column makes every frame score-invalid.
-    require_score: bool = False
 
     @property
     def max_invalid_fraction(self):
@@ -34,22 +28,10 @@ class TrackingQCConfig:
         return 1.0 - float(self.min_valid_fraction)
 
     def output_metadata(self):
-        """Return the common QC fields written to result dataframes."""
-        # Store active thresholds beside downstream analysis results for provenance.
-        return {
-            "Apply_Tracking_QC": bool(self.enabled),
-            "Min_Cameras": self.min_cameras if self.enabled else np.nan,
-            "Error_Max": self.error_max if self.enabled else np.nan,
-            "Score_Min": self.score_min if self.enabled else np.nan,
-            "Max_Interp_Gap_s": self.max_interp_gap_s if self.enabled else np.nan,
-            "Min_Valid_Fraction": (
-                self.min_valid_fraction if self.enabled else np.nan
-            ),
-            "Max_Invalid_Fraction": (
-                self.max_invalid_fraction if self.enabled else np.nan
-            ),
-            "Require_Score": bool(self.require_score) if self.enabled else False,
-        }
+        """Return compact QC metadata for result dataframes."""
+        # Routine outputs now keep QC diagnostics in summarize_invalid_mask()
+        # instead of repeating threshold/provenance columns in every result row.
+        return {}
 
 
 def build_config(
@@ -59,7 +41,6 @@ def build_config(
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
-        require_score=False,
 ):
     """Build a QC config from the current fixed-threshold, time-gap rule."""
     # Keep the public plotting arguments separate from the dataclass constructor.
@@ -70,7 +51,6 @@ def build_config(
         min_cameras=min_cameras,
         max_interp_gap_s=max_interp_gap_s,
         min_valid_fraction=min_valid_fraction,
-        require_score=require_score,
     )
 
 
@@ -83,26 +63,12 @@ def interp_gap_frames_from_fps(max_interp_gap_s, fps):
     return max(1, int(round(float(max_interp_gap_s) * float(fps))))
 
 
-def _optional_score_array(point):
-    # Accept several common confidence-column names used by tracking pipelines.
-    for attr in ("score", "likelihood", "confidence", "probability"):
-        # Skip names that are not present on the Point object.
-        if hasattr(point, attr):
-            values = getattr(point, attr)
-            # A present-but-empty score attribute is treated as unavailable.
-            if values is not None:
-                return np.asarray(values, dtype=float), getattr(point, "score_column", attr)
-    # Returning None lets the caller decide whether missing scores should fail QC.
-    return None, None
-
-
 def point_invalid_components(
         point,
         keypoint,
         min_cameras=2,
         error_max=50,
         score_min=0.8,
-        require_score=False,
 ):
     """Return frame-wise invalid components for one 3D keypoint trace."""
     # Convert point attributes to numeric arrays so NaN/finite checks are consistent.
@@ -111,6 +77,7 @@ def point_invalid_components(
     z = np.asarray(point.z_coord, dtype=float)
     camera_count = np.asarray(point.camera_count, dtype=float)
     error = np.asarray(point.error, dtype=float)
+    score = np.asarray(point.score, dtype=float)
     # Required 3D channels must be frame-aligned; missing values should be NaN,
     # not shorter arrays that silently change the analyzed window.
     required_lengths = {
@@ -119,6 +86,7 @@ def point_invalid_components(
         "z": len(z),
         "camera_count": len(camera_count),
         "error": len(error),
+        "score": len(score),
     }
     if len(set(required_lengths.values())) != 1:
         raise ValueError(
@@ -140,28 +108,10 @@ def point_invalid_components(
     # High reprojection error invalidates a frame because triangulation quality is poor.
     error_high = np.isfinite(error) & (error > threshold)
 
-    # Score/likelihood is optional unless the caller explicitly requires it.
-    score, score_column = _optional_score_array(point)
-    score_column_missing = score is None
-    if score is not None:
-        # Score channels, when present, must align to the same frame index as xyz.
-        if len(score) != n_frames:
-            raise ValueError(
-                f"Frame-length mismatch for keypoint '{keypoint}' score column "
-                f"'{score_column}': score={len(score)}, required_channels={n_frames}"
-            )
-        # Missing score values are invalid when a score column exists.
-        score_missing = ~np.isfinite(score)
-        # Scores below the caller threshold are invalid.
-        score_low = np.isfinite(score) & (score < score_min)
-    elif require_score:
-        # If score is mandatory and absent, mark all frames as score-missing.
-        score_missing = np.ones(n_frames, dtype=bool)
-        score_low = np.zeros(n_frames, dtype=bool)
-    else:
-        # If score is optional and absent, do not let it affect QC.
-        score_missing = np.zeros(n_frames, dtype=bool)
-        score_low = np.zeros(n_frames, dtype=bool)
+    # Missing score values invalidate a frame because confidence quality is unknown.
+    score_missing = ~np.isfinite(score)
+    # Scores below the caller threshold invalidate a frame.
+    score_low = np.isfinite(score) & (score < score_min)
 
     # A frame is invalid if any required coordinate, camera, error, or score rule fails.
     invalid = (
@@ -189,11 +139,8 @@ def point_invalid_components(
     # Metadata records exactly which thresholds and score column were used.
     metadata = {
         "Error_Threshold": threshold,
-        "Score_Column": score_column,
-        "Score_Column_Missing": bool(score_column_missing),
         "Min_Cameras": min_cameras,
         "Score_Min": score_min,
-        "Require_Score": bool(require_score),
     }
     return xyz, components, metadata
 
@@ -244,8 +191,6 @@ def summarize_invalid_mask(
     max_invalid_fraction = 1.0 - float(min_valid_fraction)
     # Track the longest invalid run for the long-gap exclusion rule.
     max_gap = int(max(gap_lengths)) if gap_lengths else 0
-    # Count invalid runs that exceed the interpolation threshold.
-    long_gap_count = int(sum(gap > max_interp_gap_frames for gap in gap_lengths))
     # Count invalid frames that are short enough to be candidates for interpolation.
     interpolatable_count = int(sum(
         gap for gap in gap_lengths if gap <= max_interp_gap_frames
@@ -276,45 +221,104 @@ def summarize_invalid_mask(
     if require_start_end_valid and not end_valid:
         exclusion_reasons.append("end_frame_invalid")
 
-    # Main summary used by analysis functions and QC diagnostic plots.
+    # Main summary used by analysis functions and QC diagnostic plots. This is
+    # intentionally limited to the compact diagnostic fields requested for the
+    # active analysis workflow.
     summary = {
-        "Valid_Frame_Fraction": valid_fraction,
-        "Invalid_Frame_Fraction": invalid_fraction,
-        "Invalid_Frame_Count": invalid_frames,
-        "Max_Invalid_Gap_Frames": max_gap,
-        "Long_Gap_Count": long_gap_count,
-        "Interpolated_Frame_Count": interpolatable_count,
-        "Interpolatable_Invalid_Frame_Count": interpolatable_count,
-        "Interpolatable_Invalid_Fraction": _fraction(interpolatable_count, total_frames),
-        "Start_Frame_Valid": start_valid,
-        "End_Frame_Valid": end_valid,
-        "Max_Interp_Gap_s": max_interp_gap_s,
-        "Max_Interp_Gap_Frames": max_interp_gap_frames,
-        "Min_Valid_Fraction": min_valid_fraction,
-        "Max_Invalid_Fraction": max_invalid_fraction,
         "QC_Passed": len(exclusion_reasons) == 0,
         "QC_Exclusion_Reason": ";".join(exclusion_reasons),
+        "Valid_Frame_Fraction": valid_fraction,
+        "Invalid_Frame_Fraction": invalid_fraction,
+        "Max_Invalid_Gap_Frames": max_gap,
+        "Interpolated_Frame_Count": interpolatable_count,
+        "Max_Interp_Gap_Frames": max_interp_gap_frames,
     }
 
     if components is not None:
-        # Add reason-specific counts/fractions for every provided component mask.
-        for name, mask in components.items():
-            # The combined invalid mask is already represented by the main summary.
-            if name == "invalid":
-                continue
-            # Align each component to the same window used for the combined mask.
-            mask = np.asarray(mask, dtype=bool)
-            window = (
-                mask[start_frame:end_frame + 1]
-                if end_frame >= start_frame and len(mask)
-                else np.array([], dtype=bool)
-            )
-            # Convert snake_case component names into compact dataframe column prefixes.
-            column = "".join(part.capitalize() for part in name.split("_"))
-            summary[f"{column}_Frame_Count"] = _count_true(window)
-            summary[f"{column}_Fraction"] = _fraction(_count_true(window), total_frames)
+        # Component masks are still accepted for API compatibility, but routine
+        # summaries no longer export per-component diagnostic counts/fractions.
+        pass
 
     return summary
+
+
+def qc_keypoint_xyz(
+        point,
+        keypoint,
+        fps,
+        start_frame=None,
+        end_frame=None,
+        min_cameras=2,
+        error_max=50,
+        score_min=0.8,
+        max_interp_gap_s=0.02,
+        min_valid_fraction=0.7,
+        require_start_end_valid=False,
+):
+    """
+    Run the active keypoint-first tracking QC rule for one xyz trace.
+
+    This is the main public QC entry point: it validates one keypoint, records
+    the compact diagnostic summary, and returns interpolated xyz only when the
+    keypoint passes the analysis-window QC rule.
+    """
+    # Resolve the time-based interpolation threshold using this trial's FPS.
+    max_interp_gap_frames = interp_gap_frames_from_fps(max_interp_gap_s, fps)
+    # Build frame-wise invalid components from raw xyz/camera/error/score data.
+    xyz, components, metadata = point_invalid_components(
+        point=point,
+        keypoint=keypoint,
+        min_cameras=min_cameras,
+        error_max=error_max,
+        score_min=score_min,
+    )
+    # The combined invalid mask is the single source of truth for pass/fail.
+    invalid_mask = components["invalid"]
+    # Default the QC window to the full trace when no analysis window is supplied.
+    if start_frame is None:
+        start_frame = 0
+    if end_frame is None:
+        end_frame = len(invalid_mask) - 1
+    # Clamp the requested QC window to the available frame range.
+    start_frame = max(int(start_frame), 0)
+    end_frame = min(int(end_frame), len(invalid_mask) - 1)
+    # Summarize the keypoint with only the compact diagnostic fields used by analysis.
+    summary = summarize_invalid_mask(
+        invalid_mask,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        max_interp_gap_frames=max_interp_gap_frames,
+        max_interp_gap_s=max_interp_gap_s,
+        fps=fps,
+        min_valid_fraction=min_valid_fraction,
+        require_start_end_valid=require_start_end_valid,
+    )
+    # Interpolate eligible short xyz gaps so passed keypoints are ready for geometry.
+    interpolated_xyz, interpolated_count = interpolate_invalid_xyz_gaps(
+        xyz,
+        invalid_mask,
+        max_gap_frames=max_interp_gap_frames,
+    )
+    # Record the actual number of frames filled rather than the candidate count.
+    summary["Interpolated_Frame_Count"] = int(interpolated_count)
+    # Identify this keypoint without reintroducing excessive per-component diagnostics.
+    summary["Keypoint"] = keypoint
+    # Keep threshold provenance separate so qc_summary remains compact and readable.
+    qc_metadata = {
+        "Min_Cameras": min_cameras,
+        "Error_Max": error_max,
+        "Score_Min": score_min,
+        "Max_Interp_Gap_s": max_interp_gap_s,
+    }
+    # Downstream analysis receives cleaned xyz only when this keypoint passes QC.
+    clean_xyz = interpolated_xyz if summary["QC_Passed"] else None
+    # Return a dictionary so callers can access data, mask, and diagnostics explicitly.
+    return {
+        "clean_xyz": clean_xyz,
+        "invalid_mask": invalid_mask,
+        "qc_summary": summary,
+        "qc_metadata": qc_metadata,
+    }
 
 
 def interpolate_invalid_xyz_gaps(xyz, invalid_mask, max_gap_frames=5):
@@ -364,48 +368,6 @@ def interpolate_invalid_xyz_gaps(xyz, invalid_mask, max_gap_frames=5):
     return xyz, interpolated_total
 
 
-def interpolate_invalid_trace_gaps(values, invalid_mask, max_gap_frames=5):
-    """Set invalid scalar frames to NaN and linearly interpolate short invalid runs."""
-    # Work on a numeric copy so the original scalar trace is unchanged.
-    values = np.asarray(values, dtype=float).copy()
-    # Normalize the invalid mask before applying it to the trace.
-    invalid_mask = np.asarray(invalid_mask, dtype=bool)
-    # Invalid scalar values are blanked before short-gap interpolation.
-    values[invalid_mask] = np.nan
-    interpolated_total = 0
-    n_frames = len(values)
-    # Frame numbers provide the interpolation x-axis.
-    x_index = np.arange(n_frames)
-    i = 0
-    # Scan contiguous invalid runs and handle each run immediately.
-    while i < n_frames:
-        if not invalid_mask[i]:
-            i += 1
-            continue
-        start = i
-        while i < n_frames and invalid_mask[i]:
-            i += 1
-        stop = i
-        gap_len = stop - start
-        left = start - 1
-        right = stop
-        # Fill only short internal gaps with finite values on both sides.
-        if (
-                gap_len <= max_gap_frames
-                and left >= 0
-                and right < n_frames
-                and np.isfinite(values[left])
-                and np.isfinite(values[right])
-        ):
-            # Linear interpolation preserves the trace length and frame alignment.
-            values[start:stop] = np.interp(
-                x_index[start:stop],
-                [left, right],
-                [values[left], values[right]],
-            )
-            interpolated_total += gap_len
-    return values, interpolated_total
-
 def _count_true(values):
     # Centralize boolean counting so masks are converted consistently.
     values = np.asarray(values, dtype=bool)
@@ -436,5 +398,3 @@ def _true_run_lengths(values):
     if run_length:
         lengths.append(run_length)
     return lengths
-
-

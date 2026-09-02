@@ -10,7 +10,13 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from lifelines import KaplanMeierFitter
-from lifelines.utils import restricted_mean_survival_time
+from survival_stats_runner import SurvivalStatsRunner
+
+
+def _get_stats_runner(self):
+    # PlotCreator owns the shared stats runner; direct module calls fall back to
+    # a local runner for standalone use.
+    return getattr(self, "stats_runner", SurvivalStatsRunner())
 
 def plot_manual_sc_inverted_km_from_csv(
         self,
@@ -234,12 +240,12 @@ def compare_manual_sc_rmst_across_contact_groups(
     mapping contact group names to the legs that should be analyzed.
     Example: {"T1": ("R-m", "R-h"), "T2": ("R-f", "R-h")}.
 
-    Four CSV files are saved:
-    - one within-group leg-comparison stats file per contact group
-    - one across-group same-leg comparison stats file
+    CSV exports include fly-wise RMST values, within-group leg comparisons, and
+    across-group same-leg comparison stats.
     """
-    # Use a local RNG so permutation tests are reproducible for this call.
-    rng = np.random.default_rng(random_state)
+    # Use the shared stats runner so RMST and permutation outputs follow the
+    # repository-wide statistical schema.
+    stats_runner = _get_stats_runner(self)
     # Validate that every requested contact group has both a Group object and an
     # SC annotation CSV.
     for contact_group in contact_groups:
@@ -266,49 +272,21 @@ def compare_manual_sc_rmst_across_contact_groups(
         if len(group_legs) == 0:
             raise ValueError(f"No legs were selected for contact group: {contact_group}")
 
-    # Decide which within-contact-group leg pairs will be tested. By default,
-    # all pairwise combinations of selected legs are compared.
+    # Resolve within-contact-group leg pairs. These are paired by fly because
+    # each fly can contribute RMST values for multiple legs in the same group.
     if within_group_leg_pairs is None:
         within_pairs_by_group = {
             contact_group: list(itertools.combinations(group_legs, 2))
             for contact_group, group_legs in legs_by_group.items()
         }
     elif isinstance(within_group_leg_pairs, dict):
-        within_pairs_by_group = {}
-        for contact_group, group_legs in legs_by_group.items():
-            if contact_group in within_group_leg_pairs:
-                group_pairs = [tuple(pair) for pair in within_group_leg_pairs[contact_group]]
-            else:
-                group_pairs = list(itertools.combinations(group_legs, 2))
-
-            invalid_pairs = [
-                pair for pair in group_pairs
-                if len(pair) != 2 or pair[0] not in group_legs or pair[1] not in group_legs
-            ]
-            if invalid_pairs:
-                raise ValueError(
-                    "within_group_leg_pairs must contain 2-item leg pairs from the selected "
-                    f"legs for {contact_group}. Invalid pairs: {invalid_pairs}"
-                )
-            within_pairs_by_group[contact_group] = group_pairs
+        within_pairs_by_group = {
+            contact_group: [tuple(pair) for pair in within_group_leg_pairs.get(contact_group, ())]
+            for contact_group in contact_groups
+        }
     else:
         shared_pairs = [tuple(pair) for pair in within_group_leg_pairs]
-        within_pairs_by_group = {}
-        for contact_group, group_legs in legs_by_group.items():
-            group_pairs = [
-                pair for pair in shared_pairs
-                if len(pair) == 2 and pair[0] in group_legs and pair[1] in group_legs
-            ]
-            invalid_pairs = [
-                pair for pair in shared_pairs
-                if len(pair) != 2 or pair[0] not in group_legs or pair[1] not in group_legs
-            ]
-            if invalid_pairs:
-                raise ValueError(
-                    "A shared within_group_leg_pairs list must be valid for every contact "
-                    f"group's selected legs. Invalid pairs for {contact_group}: {invalid_pairs}"
-                )
-            within_pairs_by_group[contact_group] = group_pairs
+        within_pairs_by_group = {contact_group: shared_pairs for contact_group in contact_groups}
 
     event_rows = []
     for contact_group in contact_groups:
@@ -373,72 +351,60 @@ def compare_manual_sc_rmst_across_contact_groups(
     if event_df.empty:
         raise ValueError("No manual SC observations were available for RMST analysis.")
 
-    # Compute fly-wise RMST separately for each contact group and leg.
-    kmf = KaplanMeierFitter()
-    fly_rows = []
-    for (contact_group, fly_id, leg), sub in event_df.groupby(["Contact_Group", "Fly#", "Leg"]):
-        # print(f"\n--- {contact_group}, Fly {fly_id}, {leg} ---")
-        # print(sub.to_string(index=False))
-        if sub.empty:
-            continue
-
-        kmf.fit(
-            durations=sub["Duration"],
-            event_observed=sub["Event"]
-        )
-        fly_rows.append({
-            "Contact_Group": contact_group,
-            "Fly#": fly_id,
-            "Leg": leg,
-            "RMST": float(restricted_mean_survival_time(kmf, t=threshold)),
-            "n_trials": int(len(sub)),
-            "n_events": int(sub["Event"].sum()),
-            "event_fraction": float(sub["Event"].mean()),
-        })
-
-    fly_rmst_df = pd.DataFrame(fly_rows)
+    # Compute fly-wise RMST separately for each contact group and leg through
+    # the shared stats runner.
+    fly_rmst_df = stats_runner.flywise_rmst(
+        event_df,
+        group_cols=["Contact_Group", "Leg"],
+        fly_col="Fly#",
+        duration_col="Duration",
+        event_col="Event",
+        value_name="RMST",
+        tau=threshold
+    )
     if fly_rmst_df.empty:
         raise ValueError("No fly-wise SC RMST values could be computed.")
 
-    # Within each contact group, compare leg RMST values using paired flies.
+    # Within each contact group, compare selected legs with paired sign-flip
+    # tests on fly-wise RMST values.
     within_results = {}
     for contact_group in contact_groups:
         group_df = fly_rmst_df[fly_rmst_df["Contact_Group"] == contact_group]
-        stat_rows = []
-        for leg_a, leg_b in within_pairs_by_group[contact_group]:
+        group_pairs = [
+            pair for pair in within_pairs_by_group[contact_group]
+            if len(pair) == 2
+            and pair[0] in legs_by_group[contact_group]
+            and pair[1] in legs_by_group[contact_group]
+        ]
+        within_rows = []
+        for leg_a, leg_b in group_pairs:
             paired = (
                 group_df[group_df["Leg"].isin([leg_a, leg_b])]
                 .pivot(index="Fly#", columns="Leg", values="RMST")
                 .dropna(subset=[leg_a, leg_b])
-                .reset_index()
             )
-
-            # print(f"\n=== Within {contact_group}: {leg_a} vs {leg_b} ===")
-            # print(paired.to_string(index=False))
-
-            # Paired sign-flip test uses each fly's leg-B minus leg-A RMST
-            # difference as the unit of analysis.
-            observed, p_value = self.calculator.paired_signflip_permutation_test(
-                paired[leg_a],
-                paired[leg_b],
+            stat_df = stats_runner.paired_signflip_test(
+                paired[leg_a].to_numpy(dtype=float),
+                paired[leg_b].to_numpy(dtype=float),
+                group_a=f"{contact_group}-{leg_a}",
+                group_b=f"{contact_group}-{leg_b}",
+                metric="secondary_contact_rmst",
                 n_perm=n_perm,
-                rng=rng
+                test_name="within_contact_group_paired_leg_rmst"
             )
-            stat_rows.append({
-                "Comparison_Type": "within_contact_group_paired_leg_rmst",
-                "Contact_Group": contact_group,
-                "Leg_A": leg_a,
-                "Leg_B": leg_b,
-                "n_paired_flies": int(len(paired)),
-                "mean_RMST_A": np.nan if len(paired) == 0 else float(paired[leg_a].mean()),
-                "mean_RMST_B": np.nan if len(paired) == 0 else float(paired[leg_b].mean()),
-                "mean_diff_B_minus_A": observed,
-                "permutation_p": p_value,
-                "n_perm": n_perm,
+            stat_row = stat_df.iloc[0].to_dict()
+            stat_row.update({
+                # Add only identifiers needed to trace the within-group leg
+                # comparison back to the plotted SC RMST panel.
+                "comparison_type": "within_contact_group_paired_leg_rmst",
+                "contact_group": contact_group,
+                "leg_a": leg_a,
+                "leg_b": leg_b,
                 "tau": threshold,
+                "n_pairwise_comparison": len(group_pairs),
             })
-
-        within_df = pd.DataFrame(stat_rows)
+            within_rows.append(stat_row)
+        within_df = pd.DataFrame(within_rows)
         within_results[contact_group] = within_df
         within_df.to_csv(f"{file_name}_{contact_group}_within_group.csv", index=False)
 
@@ -449,44 +415,37 @@ def compare_manual_sc_rmst_across_contact_groups(
         common_legs = sorted(set(legs_by_group[group_a]).intersection(legs_by_group[group_b]))
         for leg in common_legs:
             leg_df = fly_rmst_df[fly_rmst_df["Leg"] == leg]
-            values_a = (
-                leg_df[leg_df["Contact_Group"] == group_a]["RMST"]
-                .astype(float)
-                .dropna()
-                .to_numpy()
+            group_a_df = leg_df[leg_df["Contact_Group"] == group_a]
+            group_b_df = leg_df[leg_df["Contact_Group"] == group_b]
+            stat_df = stats_runner.unpaired_permutation_test(
+                group_a_df["RMST"].to_numpy(dtype=float),
+                group_b_df["RMST"].to_numpy(dtype=float),
+                group_a=group_a,
+                group_b=group_b,
+                metric=f"{leg}_secondary_contact_rmst",
+                n_perm=n_perm,
+                n_fly_a=group_a_df["Fly#"].nunique(),
+                n_fly_b=group_b_df["Fly#"].nunique(),
+                n_trials_a=group_a_df["n_trials"].sum(),
+                n_trials_b=group_b_df["n_trials"].sum(),
+                test_name="across_contact_group_unpaired_same_leg_rmst"
             )
-            values_b = (
-                leg_df[leg_df["Contact_Group"] == group_b]["RMST"]
-                .astype(float)
-                .dropna()
-                .to_numpy()
-            )
-
-            observed = np.nan
-            p_value = np.nan
-            if len(values_a) > 0 and len(values_b) > 0:
-                observed, p_value = self.calculator._permutation_test_unpaired(
-                    values_a,
-                    values_b,
-                    n_perm=n_perm
-                )
-
-            across_rows.append({
-                "Comparison_Type": "across_contact_group_unpaired_same_leg_rmst",
-                "Leg": leg,
-                "Contact_Group_A": group_a,
-                "Contact_Group_B": group_b,
-                "n_A": int(len(values_a)),
-                "n_B": int(len(values_b)),
-                "mean_RMST_A": np.nan if len(values_a) == 0 else float(np.mean(values_a)),
-                "mean_RMST_B": np.nan if len(values_b) == 0 else float(np.mean(values_b)),
-                "mean_diff_B_minus_A": observed,
-                "permutation_p": p_value,
-                "n_perm": n_perm,
+            stat_row = stat_df.iloc[0].to_dict()
+            stat_row.update({
+                # Same-leg comparisons across contact groups need only the leg
+                # identifier plus tau on top of the canonical unpaired row.
+                "comparison_type": "across_contact_group_unpaired_same_leg_rmst",
+                "leg": leg,
+                "contact_group_a": group_a,
+                "contact_group_b": group_b,
                 "tau": threshold,
             })
+            across_rows.append(stat_row)
 
     across_df = pd.DataFrame(across_rows)
+    if not across_df.empty:
+        # Across-group same-leg tests form their own correction family.
+        across_df["n_pairwise_comparison"] = len(across_df)
     across_df.to_csv(f"{file_name}_across_groups.csv", index=False)
 
     return fly_rmst_df, within_results, across_df
@@ -625,77 +584,92 @@ def plot_flywise_first_sc_probability_by_contact_group(
     prob_df["First_Contact_Participation_Probability"] = prob_df["Secondary_Contact_Probability"]
 
     def run_permutation(group_a, group_b, comparison_type, group_a_label, group_b_label):
-        # Compare two sets of fly-wise first-contact probabilities with an
-        # unpaired permutation test.
-        values_a = (
-            group_a["First_Contact_Participation_Probability"]
-            .astype(float)
-            .dropna()
-            .to_numpy()
+        # Compare two sets of fly-wise first-contact probabilities with the
+        # shared unpaired permutation API.
+        stat_df = _get_stats_runner(self).unpaired_permutation_test(
+            group_a["First_Contact_Participation_Probability"].to_numpy(dtype=float),
+            group_b["First_Contact_Participation_Probability"].to_numpy(dtype=float),
+            group_a=group_a_label,
+            group_b=group_b_label,
+            metric="first_secondary_contact_probability",
+            n_perm=n_perm,
+            n_fly_a=group_a["Fly#"].nunique(),
+            n_fly_b=group_b["Fly#"].nunique(),
+            n_trials_a=group_a["n_trials"].sum() if "n_trials" in group_a else None,
+            n_trials_b=group_b["n_trials"].sum() if "n_trials" in group_b else None,
+            test_name=comparison_type
         )
-        values_b = (
-            group_b["First_Contact_Participation_Probability"]
-            .astype(float)
-            .dropna()
-            .to_numpy()
-        )
-        row = {
-            "Comparison_Type": comparison_type,
-            "Group_A": group_a_label,
-            "Group_B": group_b_label,
-            "n_A": len(values_a),
-            "n_B": len(values_b),
-            "mean_A": np.nan if len(values_a) == 0 else float(np.mean(values_a)),
-            "mean_B": np.nan if len(values_b) == 0 else float(np.mean(values_b)),
-            "mean_diff_B_minus_A": np.nan,
-            "permutation_p": np.nan,
-            "n_perm": n_perm,
-        }
-        if len(values_a) == 0 or len(values_b) == 0:
-            return row
-
-        observed, p_value = self.calculator._permutation_test_unpaired(
-            values_a,
-            values_b,
-            n_perm=n_perm
-        )
-        row["mean_diff_B_minus_A"] = float(observed)
-        row["permutation_p"] = float(p_value)
+        row = stat_df.iloc[0].to_dict()
         return row
 
-    # Within each contact group, compare legs against each other.
-    stat_rows = []
-    for contact_group in contact_groups:
-        group_df = prob_df[prob_df["Contact_Group"] == contact_group]
-        for leg_a, leg_b in itertools.combinations(legs, 2):
-            stat_rows.append(run_permutation(
-                group_df[group_df["Leg"] == leg_a],
-                group_df[group_df["Leg"] == leg_b],
-                "within_contact_group_between_legs",
-                f"{contact_group}-{leg_a}",
-                f"{contact_group}-{leg_b}"
-            ))
+    # Store across-group and within-group stats separately so unpaired N_a/N_b
+    # rows are never mixed with paired N_paired rows in the same CSV.
+    across_stat_rows = []
+    within_stat_rows = []
 
-    # For each leg, compare matching legs across contact groups.
+    # Between-contact same-leg tests and within-contact leg tests remain
+    # separate planned-comparison families for later p-value correction.
+    between_comparison_count = len(legs) * len(list(itertools.combinations(contact_groups, 2)))
+    within_comparison_count = len(contact_groups) * len(list(itertools.combinations(legs, 2)))
+
+    # Across-group tests compare the same leg between contact groups with an
+    # unpaired fly-wise permutation test.
     for leg in legs:
         leg_df = prob_df[prob_df["Leg"] == leg]
         for group_a, group_b in itertools.combinations(contact_groups, 2):
-            stat_rows.append(run_permutation(
+            row = run_permutation(
                 leg_df[leg_df["Contact_Group"] == group_a],
                 leg_df[leg_df["Contact_Group"] == group_b],
                 "between_contact_groups_same_leg",
                 f"{group_a}-{leg}",
                 f"{group_b}-{leg}"
-            ))
+            )
+            # Record the leg as a context column while keeping the canonical
+            # unpaired stat columns from the stats runner unchanged.
+            row["leg"] = leg
+            row["n_pairwise_comparison"] = between_comparison_count
+            across_stat_rows.append(row)
 
-    stat_df = pd.DataFrame(stat_rows)
+    # Within-group leg comparisons are paired by fly because each fly has one
+    # first-contact probability for each leg in the same contact group.
+    for contact_group in contact_groups:
+        group_df = prob_df[prob_df["Contact_Group"] == contact_group]
+        for leg_a, leg_b in itertools.combinations(legs, 2):
+            paired = (
+                group_df[group_df["Leg"].isin([leg_a, leg_b])]
+                .pivot(index="Fly#", columns="Leg", values="First_Contact_Participation_Probability")
+                .dropna(subset=[leg_a, leg_b])
+            )
+            stat_df = _get_stats_runner(self).paired_signflip_test(
+                paired[leg_a].to_numpy(dtype=float),
+                paired[leg_b].to_numpy(dtype=float),
+                group_a=f"{contact_group}-{leg_a}",
+                group_b=f"{contact_group}-{leg_b}",
+                metric="first_secondary_contact_probability",
+                n_perm=n_perm,
+                test_name="within_contact_group_paired_leg_first_sc_probability"
+            )
+            row = stat_df.iloc[0].to_dict()
+            # Store only identifiers for the paired leg comparison; N_paired,
+            # means, stds, and p value already come from the stats runner.
+            row["contact_group"] = contact_group
+            row["leg_a"] = leg_a
+            row["leg_b"] = leg_b
+            row["n_pairwise_comparison"] = within_comparison_count
+            within_stat_rows.append(row)
+
+    # Build separate stat tables so each output file has one consistent N
+    # convention and one statistical design.
+    across_stat_df = pd.DataFrame(across_stat_rows)
+    within_stat_df = pd.DataFrame(within_stat_rows)
 
     # Export trial-level first-contact flags, fly-level probabilities, and
-    # permutation test summaries.
+    # separate across/within permutation test summaries.
     if save_csv and file_name is not None:
         trial_df.to_csv(f"{file_name}_trial_first_sc.csv", index=False)
         prob_df.to_csv(f"{file_name}_fly_probability.csv", index=False)
-        stat_df.to_csv(f"{file_name}_permutation_stats.csv", index=False)
+        across_stat_df.to_csv(f"{file_name}_across_group_same_leg_stats.csv", index=False)
+        within_stat_df.to_csv(f"{file_name}_within_group_paired_leg_stats.csv", index=False)
 
     # Plot the fly-wise probabilities as dodged stripplots by contact group and
     # leg.
@@ -730,7 +704,7 @@ def plot_flywise_first_sc_probability_by_contact_group(
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()
 
-    return fig, ax, trial_df, prob_df, stat_df
+    return fig, ax, trial_df, prob_df, across_stat_df, within_stat_df
 
 
 def plot_valid_sc_count_vs_landing_latency(
@@ -746,6 +720,7 @@ def plot_valid_sc_count_vs_landing_latency(
         jitter=0.035,
         point_size=28,
         alpha=0.78,
+        n_perm=20000,
         save_csv=True
 ):
     """
@@ -874,9 +849,31 @@ def plot_valid_sc_count_vs_landing_latency(
     if count_df.empty:
         raise ValueError("No matching SC rows with valid landing latency were found.")
 
-    # Save the trial-level count table before plotting.
+    # Compare only trial-level valid SC counts in successful versus failed
+    # trials; no latency correlation or leg/group comparisons are run here.
+    success_df = count_df[count_df["Outcome"] == "Success"]
+    failed_df = count_df[count_df["Outcome"] == "Failed"]
+    stat_df = _get_stats_runner(self).unpaired_permutation_test(
+        success_df["Valid_SC_Count"].to_numpy(dtype=float),
+        failed_df["Valid_SC_Count"].to_numpy(dtype=float),
+        group_a="Success",
+        group_b="Failed",
+        metric="valid_sc_count",
+        n_perm=n_perm,
+        n_fly_a=success_df["Fly#"].nunique(),
+        n_fly_b=failed_df["Fly#"].nunique(),
+        n_trials_a=len(success_df),
+        n_trials_b=len(failed_df),
+        test_name="success_vs_failed_valid_sc_count_unpaired_permutation"
+    )
+    # Keep the Success-vs-Failed stat table exactly as returned by the shared
+    # unpaired permutation API.
+
+    # Save the trial-level count table and the single Success-vs-Failed count
+    # comparison before plotting.
     if save_csv and file_name is not None:
         count_df.to_csv(f"{file_name}_data.csv", index=False)
+        stat_df.to_csv(f"{file_name}_success_failed_count_stats.csv", index=False)
 
     fig, ax = plt.subplots(figsize=(6.4, 4.4))
 
@@ -935,4 +932,4 @@ def plot_valid_sc_count_vs_landing_latency(
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()
 
-    return fig, ax, count_df
+    return fig, ax, count_df, stat_df

@@ -107,178 +107,6 @@ def Get3D_path(source_folder, required=True):
     return grouped_data_path
 
 
-def validate_kinematic_metadata_file_mapping(group_info, save_csv_path=None):
-    """
-    Check whether kinematic CSV paths align with metadata fly/trial indexes.
-
-    Validation rules:
-    - Metadata fly number must match the fly number encoded in the parent fly
-      folder, e.g. ANxGTACR-Max-F11.
-    - Metadata trial number must match the Trial_# encoded in the CSV filename.
-    - Filename Fly_# is recorded as within-session fly number and is not treated
-      as an error.
-
-    Returns a DataFrame with one row per kinematic CSV mapping, plus one row for
-    each metadata trial that lacks a matching kinematic CSV.
-    """
-    if len(group_info.trial_metadata) == 0:
-        if "CHR" in group_info.group_name or "Chr" in group_info.group_name:
-            group_info.initialize_Chr_manual_data()
-        else:
-            group_info.initialize_manual_data()
-
-    # Use already grouped paths when available. This avoids reading CSV
-    # contents and avoids re-parsing a dict through Get3D_path.
-    source_paths = getattr(group_info, "fly_kinematic_data_path", None)
-    if isinstance(source_paths, dict):
-        grouped_paths = source_paths
-    else:
-        source_folder = getattr(group_info, "kinematic_data_path", source_paths)
-        grouped_paths = Get3D_path(source_folder, required=False)
-    metadata_keys = set(group_info.trial_metadata.keys())
-    mapped_metadata_keys = set()
-    rows = []
-
-    key_pattern = re.compile(r"^F(?P<fly>\d+)T(?P<trial>\d+)$")
-    folder_fly_pattern = re.compile(r"(?:^|[-_])F(?P<fly>\d+)(?:$|[-_])", re.IGNORECASE)
-    filename_trial_pattern = re.compile(
-        r"_Fly_?(?P<filename_fly>\d+)_Trial_?(?P<trial>\d+)_",
-        re.IGNORECASE
-    )
-    manifest_filename_pattern = re.compile(
-        r"^F(?P<filename_fly>\d+)_T(?P<trial>\d+)"
-        r"(?:_cond(?P<condition>[^_]+))?"
-        r"(?:_fps(?P<fps>\d+))?",
-        re.IGNORECASE
-    )
-
-    for key, csv_path in grouped_paths.items():
-        key_match = key_pattern.match(key)
-        metadata_fly = int(key_match.group("fly")) if key_match else np.nan
-        metadata_trial = int(key_match.group("trial")) if key_match else np.nan
-
-        path_parts = os.path.normpath(csv_path).split(os.sep)
-        fly_folder = ""
-        folder_fly = np.nan
-        for part in reversed(path_parts[:-1]):
-            folder_match = folder_fly_pattern.search(part)
-            if folder_match:
-                fly_folder = part
-                folder_fly = int(folder_match.group("fly"))
-                break
-
-        filename = os.path.basename(csv_path)
-        filename_match = filename_trial_pattern.search(filename)
-        manifest_match = manifest_filename_pattern.search(filename)
-        active_filename_match = manifest_match if manifest_match else filename_match
-        filename_fly = (
-            int(active_filename_match.group("filename_fly"))
-            if active_filename_match
-            else np.nan
-        )
-        filename_trial = (
-            int(active_filename_match.group("trial"))
-            if active_filename_match
-            else np.nan
-        )
-        parsed_fps = getattr(csv_path, "fps", None)
-        if parsed_fps is None and manifest_match and manifest_match.group("fps"):
-            parsed_fps = int(manifest_match.group("fps"))
-        legacy_fps = (
-            group_info._legacy_fly_fps(metadata_fly)
-            if hasattr(group_info, "_legacy_fly_fps") and not pd.isna(metadata_fly)
-            else np.nan
-        )
-        if parsed_fps is None:
-            fps_status = "MISSING_FILENAME_FPS"
-        elif pd.isna(legacy_fps):
-            fps_status = "NO_LEGACY_FPS_TO_VALIDATE"
-        elif int(parsed_fps) == int(legacy_fps):
-            fps_status = "OK"
-        else:
-            fps_status = "FPS_MISMATCH"
-
-        fly_matches_folder = (
-            not pd.isna(metadata_fly)
-            and not pd.isna(folder_fly)
-            and int(metadata_fly) == int(folder_fly)
-        )
-        trial_matches_filename = (
-            not pd.isna(metadata_trial)
-            and not pd.isna(filename_trial)
-            and int(metadata_trial) == int(filename_trial)
-        )
-
-        statuses = []
-        if key not in metadata_keys:
-            statuses.append("CSV_WITHOUT_METADATA")
-        else:
-            mapped_metadata_keys.add(key)
-
-        if pd.isna(folder_fly):
-            statuses.append("MISSING_FOLDER_FLY")
-        elif not fly_matches_folder:
-            statuses.append("FLY_FOLDER_MISMATCH")
-
-        if pd.isna(filename_trial):
-            statuses.append("MISSING_FILENAME_TRIAL")
-        elif not trial_matches_filename:
-            statuses.append("TRIAL_FILENAME_MISMATCH")
-        if fps_status == "FPS_MISMATCH":
-            statuses.append(fps_status)
-
-        if not statuses:
-            statuses.append("OK")
-
-        rows.append({
-            "Group_Name": group_info.group_name,
-            "Key": key,
-            "Metadata_Fly": metadata_fly,
-            "Metadata_Trial": metadata_trial,
-            "Fly_Folder": fly_folder,
-            "Folder_Fly": folder_fly,
-            "Filename_Fly_Within_Session": filename_fly,
-            "Filename_Trial": filename_trial,
-            "Filename_FPS": parsed_fps if parsed_fps is not None else np.nan,
-            "Legacy_FPS": legacy_fps,
-            "FPS_Status": fps_status,
-            "Metadata_Fly_Matches_Folder": fly_matches_folder,
-            "Metadata_Trial_Matches_Filename": trial_matches_filename,
-            "Status": ";".join(statuses),
-            "CSV_Path": csv_path,
-        })
-
-    missing_csv_keys = sorted(metadata_keys - mapped_metadata_keys)
-    for key in missing_csv_keys:
-        key_match = key_pattern.match(key)
-        rows.append({
-            "Group_Name": group_info.group_name,
-            "Key": key,
-            "Metadata_Fly": int(key_match.group("fly")) if key_match else np.nan,
-            "Metadata_Trial": int(key_match.group("trial")) if key_match else np.nan,
-            "Fly_Folder": "",
-            "Folder_Fly": np.nan,
-            "Filename_Fly_Within_Session": np.nan,
-            "Filename_Trial": np.nan,
-            "Filename_FPS": np.nan,
-            "Legacy_FPS": (
-                group_info._legacy_fly_fps(int(key_match.group("fly")))
-                if hasattr(group_info, "_legacy_fly_fps") and key_match
-                else np.nan
-            ),
-            "FPS_Status": "NO_CSV_TO_VALIDATE",
-            "Metadata_Fly_Matches_Folder": False,
-            "Metadata_Trial_Matches_Filename": False,
-            "Status": "MISSING_CSV_FOR_METADATA",
-            "CSV_Path": "",
-        })
-
-    result_df = pd.DataFrame(rows)
-    if save_csv_path is not None:
-        result_df.to_csv(save_csv_path, index=False)
-    return result_df
-
-
 # ------------------------------------------------------------
 # Data objects
 # ------------------------------------------------------------
@@ -339,16 +167,9 @@ class Trial:
         data = dict()
 
         for j in self.joints:
-            score_column = None
-            for candidate in (
-                    f"{j}_score",
-                    f"{j}_likelihood",
-                    f"{j}_confidence",
-                    f"{j}_probability",
-            ):
-                if candidate in kine_data.columns:
-                    score_column = candidate
-                    break
+            # Score is a required tracking-quality channel with the same naming
+            # convention as xyz, camera count, and reprojection error.
+            score_column = f"{j}_score"
             data[j] = Point(
                 name=j,
                 x=kine_data[f"{j}_x"],
@@ -356,7 +177,7 @@ class Trial:
                 z=kine_data[f"{j}_z"],
                 cam_count=kine_data[f"{j}_ncams"],
                 error=kine_data[f"{j}_error"],
-                score=kine_data[score_column] if score_column is not None else None,
+                score=kine_data[score_column],
                 score_column=score_column,
             )
 

@@ -22,11 +22,15 @@ import plot_landing as pl
 import plot_optogenetics as po
 import plot_secondary_contact as psc
 import plot_angles as pa
+from survival_stats_runner import SurvivalStatsRunner
 
 
 class PlotCreator:
     def __init__(self):
         self.calculator = ku.SimpleCalculation()
+        # Centralize inferential tests behind one runner while plotting modules
+        # remain responsible only for collecting data and drawing figures.
+        self.stats_runner = SurvivalStatsRunner()
         self.key_point_pairs = [
             ["L-wing", "L-wing-hinge"],
             ["R-wing", "R-wing-hinge"],
@@ -71,17 +75,10 @@ class PlotCreator:
             self,
             group_info,
             sc_csv_paths,
-            tt_joints=("L-fTT", "L-mTT", "L-hTT"),
-            plane_axis=("R-mBC", "L-mBC"),
-            origin_keypoint="R-mBC",
-            trial_types=("Landing", "Flying"),
             tau=0.71,
             axis_average_frames=100,
-            axis_average_anchor="moc",
             file_name="TT_MOC_to_SLC_endpoint_projected_combined",
             colors=None,
-            target_fps=250,
-            trajectory_average_mode="absolute_time",
             normalized_average_points=200,
             trial_color="0.55",
             trial_linewidth=0.25,
@@ -89,17 +86,13 @@ class PlotCreator:
             fly_linewidth=1.4,
             fly_alpha=0.95,
             radial_circle_diameter=None,
-            radial_coordinate_mode="displacement_origin",
-            n_perm=20000,
-            random_state=0,
-            radial_stats_file_name=None,
+            n_perm=10000,
             apply_tracking_qc=False,
             min_cameras=2,
             max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             save_csv=True
     ):
         return pg.plot_TT_MOC_to_SLC_endpoint_projected_combined(**locals())
@@ -143,10 +136,7 @@ class PlotCreator:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             smooth_angle=True,
-            smooth_window_frames=5,
-            smooth_polyorder=2,
             qc_start=0,
             qc_end=2.0
     ):
@@ -168,11 +158,7 @@ class PlotCreator:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             smooth_angle=False,
-            smooth_method="savgol",
-            smooth_window_frames=5,
-            smooth_polyorder=2,
             smooth_alpha=0.4,
             save_csv=True
     ):
@@ -193,11 +179,7 @@ class PlotCreator:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             smooth_angle=False,
-            smooth_method="savgol",
-            smooth_window_frames=5,
-            smooth_polyorder=2,
             smooth_alpha=0.4,
             save_csv=True
     ):
@@ -239,7 +221,6 @@ class PlotCreator:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             smooth_angle=False,
             smooth_method="savgol",
             smooth_window_frames=5,
@@ -289,6 +270,7 @@ class PlotCreator:
             jitter=0.035,
             point_size=28,
             alpha=0.78,
+            n_perm=20000,
             save_csv=True
     ):
         return psc.plot_valid_sc_count_vs_landing_latency(**locals())
@@ -296,11 +278,7 @@ class PlotCreator:
             self,
             group_info,
             file_name="left_TT_path_efficiency_grouped_stripplots",
-            legs=("L-f", "L-m", "L-h"),
-            trial_types=("Landing", "Flying"),
             tau=0.71,
-            trajectory_window_mode="fixed",
-            trajectory_window_s=0.10,
             min_frames=3,
             min_path_length=1e-6,
             sc_csv_path=None,
@@ -312,8 +290,7 @@ class PlotCreator:
             max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
-            score_min=0.8,
-            require_score=False
+            score_min=0.8
     ):
         return pg.plot_left_TT_path_efficiency_grouped_stripplots(**locals())
     def plot_chrimson_LP_metadata(
@@ -356,28 +333,26 @@ class PlotCreator:
             random_state=0,
             colors=None,
             invert_curve=False,
+            group_pairs=None,
+            control_group=None,
     ):
         return po.plot_kmc_and_unpaired_rmst_perm(**locals())
     def plot_TT_summary_metrics_vs_LL(
             self,
             group_info,
-            leg="L-h",
-            trial_types=("Landing", "Flying"),
             tau=0.71,
-            trajectory_window_mode="mol_adjusted",
-            trajectory_window_s=0.10,
             min_frames=3,
             min_path_length=1e-6,
             sc_csv_path=None,
             file_name="TT_summary_metrics_vs_LL",
             save_csv=True,
+            n_perm=20000,
             apply_tracking_qc=False,
             min_cameras=2,
             max_interp_gap_s=0.02,
             min_valid_fraction=0.7,
             error_max=50,
-            score_min=0.8,
-            require_score=False
+            score_min=0.8
     ):
         return pg.plot_TT_summary_metrics_vs_LL(**locals())
 

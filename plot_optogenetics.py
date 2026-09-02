@@ -14,6 +14,7 @@ from lifelines.utils import restricted_mean_survival_time
 from openpyxl import load_workbook
 
 import tracking_qc as tqc
+from survival_stats_runner import SurvivalStatsRunner
 
 
 def _significance_label(p_value, missing_label=""):
@@ -28,6 +29,12 @@ def _significance_label(p_value, missing_label=""):
     if p_value < 0.05:
         return "*"
     return "n.s."
+
+
+def _get_stats_runner(self):
+    # Use PlotCreator's shared stats runner when available; direct calls get a
+    # local runner so this module remains independently testable.
+    return getattr(self, "stats_runner", SurvivalStatsRunner())
 
 def _initialize_chrimson_absolute_mol_metadata(
         group_info,
@@ -183,25 +190,24 @@ def plot_chrimson_LP_metadata(
     paired_df = paired_df.dropna(subset=["OFF", "ON"]).copy()
     if len(paired_df) >= 2:
         paired_df["Diff_ON_minus_OFF"] = paired_df["ON"] - paired_df["OFF"]
-        observed_diff, p_val = self.calculator.paired_signflip_permutation_test(
+        # Delegate the paired OFF-vs-ON LP sign-flip test to the shared stats runner.
+        stat_df = _get_stats_runner(self).paired_signflip_test(
             paired_df["OFF"].values,
             paired_df["ON"].values,
+            group_a="OFF",
+            group_b="ON",
+            metric="metadata_landing_probability",
             n_perm=20000,
-            rng=np.random.default_rng(0)
+            n_trials_a=int(combined_df[combined_df["Group_Name"] == "OFF"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
+            n_trials_b=int(combined_df[combined_df["Group_Name"] == "ON"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
+            test_name="metadata_lp_paired_signflip"
         )
-        stat_df = pd.DataFrame([{
-            "Group": group_info.group_name,
-            "Test": "paired sign-flip permutation",
-            "Metric": "Metadata landing probability",
-            "n_paired_flies": len(paired_df),
-            "mean_OFF": paired_df["OFF"].mean(),
-            "mean_ON": paired_df["ON"].mean(),
-            "mean_diff_ON_minus_OFF": observed_diff,
-            "p_value": p_val,
-            "n_perm": 20000,
-            "tau": tau,
-            "light_on_frame": light_on_frame,
-        }])
+        # Add only metadata-specific context; the paired sign-flip result is
+        # already standardized by the stats runner.
+        stat_df.insert(0, "figure_group", group_info.group_name)
+        stat_df["tau"] = tau
+        stat_df["light_on_frame"] = light_on_frame
+        p_val = float(stat_df.iloc[0]["p_value"])
     else:
         paired_df["Diff_ON_minus_OFF"] = np.nan
         p_val = np.nan
@@ -285,6 +291,8 @@ def plot_kmc_and_unpaired_rmst_perm(self,
         random_state=0,
         colors=None,
         invert_curve=False,
+        group_pairs=None,
+        control_group=None,
 ):
     if colors is None:
         colors = sns.color_palette("tab20", 20)
@@ -374,37 +382,36 @@ def plot_kmc_and_unpaired_rmst_perm(self,
     # ------------------------------------------------------------
     # Pairwise unpaired permutation tests on fly-level RMST
     # ------------------------------------------------------------
-    stat_rows = []
+    # Restrict RMST tests to planned comparisons when requested; by default the
+    # legacy behavior still compares all groups.
+    if group_pairs is None:
+        if control_group is None:
+            group_pairs = list(itertools.combinations(group_order, 2))
+        else:
+            # Require an exact group label match so planned control comparisons
+            # cannot silently disappear because of a typo.
+            if control_group not in group_order:
+                raise ValueError(f"control_group '{control_group}' was not found in plotted groups: {group_order}")
+            group_pairs = [
+                (control_group, group_name)
+                for group_name in group_order
+                if group_name != control_group
+            ]
 
-    for group_a, group_b in itertools.combinations(group_order, 2):
-        x = fly_rmst_df.loc[fly_rmst_df["Group"] == group_a, "RMST"].values
-        y = fly_rmst_df.loc[fly_rmst_df["Group"] == group_b, "RMST"].values
-
-        if len(x) == 0 or len(y) == 0:
-            continue
-
-        observed_diff, p_value = self.calculator._permutation_test_unpaired(
-            x,
-            y,
-            n_perm=n_perm,
-            rng=np.random.default_rng(random_state)
-        )
-
-        stat_rows.append({
-            "comparison": f"{group_a} vs {group_b}",
-            "group_a": group_a,
-            "group_b": group_b,
-            "n_fly_a": len(x),
-            "n_fly_b": len(y),
-            "mean_rmst_a": np.mean(x),
-            "mean_rmst_b": np.mean(y),
-            "estimate_b_minus_a": observed_diff,
-            "permutation_p": p_value,
-            "tau": tau,
-            "n_perm": n_perm,
-        })
-
-    stat_df = pd.DataFrame(stat_rows)
+    # The stats runner standardizes pairwise RMST comparisons and output columns.
+    stat_df = _get_stats_runner(self).pairwise_flywise_rmst_permutation(
+        fly_rmst_df,
+        group_col="Group",
+        value_col="RMST",
+        trial_count_col="n_trials",
+        group_pairs=group_pairs,
+        metric="landing_latency_rmst",
+        n_perm=n_perm
+    )
+    if not stat_df.empty:
+        # RMST depends on tau, so keep tau as the only plot-level addition to
+        # the standardized pairwise RMST table.
+        stat_df["tau"] = tau
     stat_df.to_csv(f"{file_name}-pairwise_rmst_permutation.csv", index=False)
 
     return stat_df, fly_rmst_df

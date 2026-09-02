@@ -89,68 +89,6 @@ class SimpleCalculation:
             kinematic_data.trial_data[point].z_coord
         ]))
 
-    def get_tracking_qc_mask(
-            self,
-            trial_info,
-            keypoints,
-            min_cameras=2,
-            require_finite_error=True,
-            error_max=50,
-            score_min=0.8,
-            require_score=False,
-    ):
-        """
-        Return one frame-wise QC mask requiring every listed keypoint to pass.
-
-        A point/frame is valid when xyz are finite, camera count is at least
-        min_cameras, reprojection error is finite and below threshold, and
-        optional score fields pass score_min.
-        """
-        if isinstance(keypoints, str):
-            keypoints = [keypoints]
-
-        n_frames = int(trial_info.total_frames_number)
-        combined_mask = np.ones(n_frames, dtype=bool)
-        point_summaries = []
-
-        for keypoint in keypoints:
-            if keypoint not in trial_info.trial_data:
-                combined_mask &= False
-                point_summaries.append({
-                    "Keypoint": keypoint,
-                    "Reason": "missing_keypoint",
-                    "Valid_Frame_Fraction": 0.0,
-                })
-                continue
-
-            point = trial_info.trial_data[keypoint]
-            _, components, metadata = tqc.point_invalid_components(
-                point=point,
-                keypoint=keypoint,
-                min_cameras=min_cameras,
-                error_max=error_max,
-                score_min=score_min,
-                require_score=require_score,
-            )
-            if not require_finite_error:
-                invalid = components["invalid"] & ~components["error_missing"]
-            else:
-                invalid = components["invalid"]
-            mask = ~invalid
-            combined_mask &= mask
-            point_summaries.append({
-                "Keypoint": keypoint,
-                "Reason": "ok",
-                "Valid_Frame_Fraction": float(np.mean(mask)) if len(mask) else np.nan,
-                "Min_Cameras": min_cameras,
-                "Error_Threshold": metadata["Error_Threshold"],
-                "Score_Min": score_min,
-                "Score_Column": metadata["Score_Column"],
-                "Score_Column_Missing": metadata["Score_Column_Missing"],
-            })
-
-        return combined_mask, pd.DataFrame(point_summaries)
-
     def invalid_gap_lengths(self, valid_mask):
         valid_mask = np.asarray(valid_mask, dtype=bool)
         gaps = []
@@ -186,77 +124,6 @@ class SimpleCalculation:
             )
         return values
 
-    def apply_angle_tracking_qc(
-            self,
-            trial_info,
-            angle_trace,
-            angle_points,
-            min_cameras=2,
-            max_interp_gap_s=0.02,
-            min_valid_fraction=0.7,
-            error_max=50,
-            score_min=0.8,
-            require_score=False,
-            start_frame=None,
-            end_frame=None,
-            smooth=False,
-            smooth_method="savgol",
-            smooth_window_frames=5,
-            smooth_polyorder=2,
-            smooth_alpha=0.4
-    ):
-        """
-        Apply tracking QC to one angle trace.
-
-        Invalid frames are set to NaN. Short gaps are linearly interpolated
-        using a time-based threshold resolved from the trial FPS.
-        """
-        # Convert the 20 ms interpolation rule to this trial's native frame count.
-        max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
-        angle_trace = np.asarray(angle_trace, dtype=float).copy()
-        qc_mask, point_summary = self.get_tracking_qc_mask(
-            trial_info,
-            angle_points,
-            min_cameras=min_cameras,
-            require_finite_error=True,
-            error_max=error_max,
-            score_min=score_min,
-            require_score=require_score,
-        )
-        invalid_mask = (~qc_mask) | ~np.isfinite(angle_trace)
-        interpolated, interpolated_count = tqc.interpolate_invalid_trace_gaps(
-            angle_trace,
-            invalid_mask,
-            max_gap_frames=max_interp_gap_frames
-        )
-        if smooth:
-            interpolated = self.smooth_trace_ema(
-                interpolated,
-                alpha=smooth_alpha,
-            )
-
-        summary = tqc.summarize_invalid_mask(
-            invalid_mask,
-            start_frame=start_frame,
-            end_frame=end_frame,
-            max_interp_gap_frames=max_interp_gap_frames,
-            max_interp_gap_s=max_interp_gap_s,
-            min_valid_fraction=min_valid_fraction,
-        )
-        summary.update({
-            "Interpolated_Frame_Count": int(interpolated_count),
-            "Min_Cameras": min_cameras,
-            "Max_Interp_Gap_s": max_interp_gap_s,
-            "Error_Max": error_max,
-            "Score_Min": score_min,
-            "Require_Score": bool(require_score),
-            "Smooth_Angle": bool(smooth),
-            "Smooth_Method": smooth_method if smooth else "",
-            "Smooth_Window_Frames": smooth_window_frames,
-            "Smooth_Alpha": smooth_alpha if smooth else np.nan,
-        })
-        return interpolated, ~invalid_mask, summary, point_summary
-
     def apply_xyz_tracking_qc(
             self,
             trial_info,
@@ -266,7 +133,6 @@ class SimpleCalculation:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             start_frame=None,
             end_frame=None,
             require_start_end_valid=False
@@ -277,62 +143,117 @@ class SimpleCalculation:
         Invalid frames are set to NaN, and invalid gaps up to max_interp_gap_s
         are linearly interpolated independently for x/y/z.
         """
-        # Convert the 20 ms interpolation rule to this trial's native frame count.
-        max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps)
+        # Use the new single keypoint-level QC entry point so xyz QC has one source of truth.
         point = trial_info.trial_data[keypoint]
-        xyz, components, metadata = tqc.point_invalid_components(
+        qc_result = tqc.qc_keypoint_xyz(
             point=point,
             keypoint=keypoint,
-            min_cameras=min_cameras,
-            error_max=error_max,
-            score_min=score_min,
-            require_score=require_score,
-        )
-        invalid_mask = components["invalid"]
-        filtered, interpolated_count = tqc.interpolate_invalid_xyz_gaps(
-            xyz,
-            invalid_mask,
-            max_gap_frames=max_interp_gap_frames
-        )
-
-        if start_frame is None:
-            start_frame = 0
-        if end_frame is None:
-            end_frame = len(invalid_mask) - 1
-        start_frame = max(int(start_frame), 0)
-        end_frame = min(int(end_frame), len(invalid_mask) - 1)
-        summary = tqc.summarize_invalid_mask(
-            invalid_mask,
-            components=components,
+            fps=trial_info.fps,
             start_frame=start_frame,
             end_frame=end_frame,
-            max_interp_gap_frames=max_interp_gap_frames,
+            min_cameras=min_cameras,
             max_interp_gap_s=max_interp_gap_s,
             min_valid_fraction=min_valid_fraction,
+            error_max=error_max,
+            score_min=score_min,
             require_start_end_valid=require_start_end_valid,
         )
-        summary.update({
-            "Keypoint": keypoint,
-            "Interpolated_Frame_Count": int(interpolated_count),
-            "Min_Cameras": min_cameras,
-            "Max_Interp_Gap_s": max_interp_gap_s,
-            "Error_Max": error_max,
-            "Score_Min": score_min,
-            "Require_Score": bool(require_score),
-            **metadata,
-        })
+        # Keep the compatibility wrapper behavior: failed keypoints return NaN xyz traces.
+        filtered = qc_result["clean_xyz"]
+        if filtered is None:
+            raw_n_frames = len(qc_result["invalid_mask"])
+            filtered = np.full((raw_n_frames, 3), np.nan, dtype=float)
+        # Reuse the compact summary emitted by tracking_qc instead of rebuilding it here.
+        summary = dict(qc_result["qc_summary"])
+        # Keep threshold and score-column provenance separate from the compact pass/fail summary.
+        metadata = dict(qc_result["qc_metadata"])
+        # The valid mask remains useful for existing geometry code that expects this return value.
+        valid_mask = ~qc_result["invalid_mask"]
         point_summary = pd.DataFrame([{
             "Keypoint": keypoint,
-            "Reason": "ok",
+            "Reason": summary["QC_Exclusion_Reason"] or "ok",
             "Valid_Frame_Fraction": summary["Valid_Frame_Fraction"],
             "Invalid_Frame_Fraction": summary["Invalid_Frame_Fraction"],
-            "Min_Cameras": min_cameras,
-            "Error_Threshold": metadata["Error_Threshold"],
-            "Score_Min": score_min,
-            "Score_Column": metadata["Score_Column"],
-            "Score_Column_Missing": metadata["Score_Column_Missing"],
         }])
-        return filtered, ~invalid_mask, summary, point_summary
+        return filtered, valid_mask, summary, point_summary
+
+    def _angle_trace_from_xyz(self, xyz_a, xyz_b, xyz_c, n_frames):
+        """Calculate one angle trace from three frame-aligned cleaned xyz arrays."""
+        # Allocate the output up front so failed/undefined frames remain explicit NaNs.
+        angle_trace = np.full(n_frames, np.nan, dtype=float)
+        # Calculate each frame from cleaned xyz; any non-finite coordinate yields NaN.
+        for f in range(n_frames):
+            if (
+                    np.all(np.isfinite(xyz_a[f]))
+                    and np.all(np.isfinite(xyz_b[f]))
+                    and np.all(np.isfinite(xyz_c[f]))
+            ):
+                angle_trace[f] = self.calculate_angle(
+                    x1=xyz_a[f, 0],
+                    y1=xyz_a[f, 1],
+                    z1=xyz_a[f, 2],
+                    x2=xyz_b[f, 0],
+                    y2=xyz_b[f, 1],
+                    z2=xyz_b[f, 2],
+                    x3=xyz_c[f, 0],
+                    y3=xyz_c[f, 1],
+                    z3=xyz_c[f, 2],
+                )
+        return angle_trace
+
+    def _aggregate_keypoint_qc_for_angle(self, keypoint_summaries, joint_name, angle_definition):
+        """Collapse three keypoint QC rows into one compact angle-level summary."""
+        # Convert the keypoint dictionaries into a dataframe for clear aggregation.
+        keypoint_df = pd.DataFrame(keypoint_summaries)
+        # The angle passes only when every required keypoint passes independently.
+        qc_passed = bool(keypoint_df["QC_Passed"].all()) if not keypoint_df.empty else False
+        # Failed keypoint reasons are preserved with the keypoint name for debugging.
+        failed_reasons = []
+        for _, row in keypoint_df.iterrows():
+            if not bool(row.get("QC_Passed", False)):
+                reason = row.get("QC_Exclusion_Reason", "") or "qc_failed"
+                failed_reasons.append(f"{row.get('Keypoint', 'unknown')}:{reason}")
+        # Angle-level fractions use conservative keypoint-first aggregation, not a combined mask.
+        valid_fraction = (
+            float(keypoint_df["Valid_Frame_Fraction"].min())
+            if "Valid_Frame_Fraction" in keypoint_df and not keypoint_df.empty
+            else np.nan
+        )
+        invalid_fraction = (
+            float(keypoint_df["Invalid_Frame_Fraction"].max())
+            if "Invalid_Frame_Fraction" in keypoint_df and not keypoint_df.empty
+            else np.nan
+        )
+        # The longest invalid gap across the three keypoints determines the angle burden.
+        max_invalid_gap = (
+            int(keypoint_df["Max_Invalid_Gap_Frames"].max())
+            if "Max_Invalid_Gap_Frames" in keypoint_df and not keypoint_df.empty
+            else 0
+        )
+        # Sum interpolated frames across keypoints to record total xyz correction burden.
+        interpolated_count = (
+            int(keypoint_df["Interpolated_Frame_Count"].sum())
+            if "Interpolated_Frame_Count" in keypoint_df and not keypoint_df.empty
+            else 0
+        )
+        # The interpolation threshold is shared across keypoints within the same trial.
+        max_interp_gap = (
+            int(keypoint_df["Max_Interp_Gap_Frames"].max())
+            if "Max_Interp_Gap_Frames" in keypoint_df and not keypoint_df.empty
+            else 0
+        )
+        # Return the same compact QC fields expected by downstream plotting/stat code.
+        return {
+            "Joint": joint_name,
+            "Angle_Definition": angle_definition,
+            "QC_Passed": qc_passed,
+            "QC_Exclusion_Reason": ";".join(failed_reasons),
+            "Valid_Frame_Fraction": valid_fraction,
+            "Invalid_Frame_Fraction": invalid_fraction,
+            "Max_Invalid_Gap_Frames": max_invalid_gap,
+            "Interpolated_Frame_Count": interpolated_count,
+            "Max_Interp_Gap_Frames": max_interp_gap,
+        }
 
     def Calculate_joint_angle(
             self,
@@ -344,7 +265,6 @@ class SimpleCalculation:
             min_valid_fraction=0.7,
             error_max=50,
             score_min=0.8,
-            require_score=False,
             smooth_angle=False,
             smooth_method="savgol",
             smooth_window_frames=5,
@@ -352,7 +272,8 @@ class SimpleCalculation:
             smooth_alpha=0.4,
             qc_start=None,
             qc_end=None,
-            return_qc=False
+            return_qc=False,
+            return_keypoint_qc=False
     ):
         """
         Calculate specified joint angles for each frame.
@@ -362,13 +283,82 @@ class SimpleCalculation:
         """
         collected_angle_data = dict()
         qc_summaries = []
+        keypoint_qc_summaries = []
+        n_frames = int(trial_info.total_frames_number)
 
         for ag in angles:
             joint_name = ag[1]
-            if joint_name not in collected_angle_data:
-                collected_angle_data[joint_name] = []
-            for f in range(trial_info.total_frames_number):
-                angle = self.calculate_angle(
+            angle_definition = "|".join(ag)
+
+            if apply_tracking_qc:
+                # Keypoint-first QC: each point is cleaned independently before angle calculation.
+                cleaned_xyz_by_keypoint = {}
+                angle_keypoint_summaries = []
+                for keypoint in ag:
+                    if keypoint not in trial_info.trial_data:
+                        # Missing keypoints fail the angle trace immediately but still produce diagnostics.
+                        summary = {
+                            "Keypoint": keypoint,
+                            "QC_Passed": False,
+                            "QC_Exclusion_Reason": "missing_keypoint",
+                            "Valid_Frame_Fraction": 0.0,
+                            "Invalid_Frame_Fraction": 1.0,
+                            "Max_Invalid_Gap_Frames": n_frames,
+                            "Interpolated_Frame_Count": 0,
+                            "Max_Interp_Gap_Frames": tqc.interp_gap_frames_from_fps(max_interp_gap_s, trial_info.fps),
+                        }
+                        cleaned_xyz_by_keypoint[keypoint] = None
+                    else:
+                        # Run the single point-level QC function through the compatibility wrapper.
+                        cleaned_xyz, _, summary, _ = self.apply_xyz_tracking_qc(
+                            trial_info=trial_info,
+                            keypoint=keypoint,
+                            min_cameras=min_cameras,
+                            max_interp_gap_s=max_interp_gap_s,
+                            min_valid_fraction=min_valid_fraction,
+                            error_max=error_max,
+                            score_min=score_min,
+                            start_frame=qc_start,
+                            end_frame=qc_end,
+                            require_start_end_valid=False,
+                        )
+                        cleaned_xyz_by_keypoint[keypoint] = cleaned_xyz if summary["QC_Passed"] else None
+                    # Annotate keypoint diagnostics with the angle they contributed to.
+                    summary = dict(summary)
+                    summary["Joint"] = joint_name
+                    summary["Angle_Definition"] = angle_definition
+                    angle_keypoint_summaries.append(summary)
+                    keypoint_qc_summaries.append(summary)
+
+                # Collapse the three point summaries into one angle-level pass/fail row.
+                qc_summary = self._aggregate_keypoint_qc_for_angle(
+                    angle_keypoint_summaries,
+                    joint_name=joint_name,
+                    angle_definition=angle_definition,
+                )
+                qc_summaries.append(qc_summary)
+
+                if qc_summary["QC_Passed"]:
+                    # Passed traces are calculated from interpolated xyz, not from raw angle values.
+                    angle_trace = self._angle_trace_from_xyz(
+                        cleaned_xyz_by_keypoint[ag[0]],
+                        cleaned_xyz_by_keypoint[ag[1]],
+                        cleaned_xyz_by_keypoint[ag[2]],
+                        n_frames=n_frames,
+                    )
+                    # EMA smoothing
+                    if smooth_angle:
+                        angle_trace = self.smooth_trace_ema(angle_trace, alpha=smooth_alpha)
+                    collected_angle_data[joint_name] = angle_trace
+                else:
+                    # Failed angle traces remain frame-aligned but contain no usable angle values.
+                    collected_angle_data[joint_name] = np.full(n_frames, np.nan, dtype=float)
+                continue
+
+            # Without tracking QC, preserve the raw frame-wise angle calculation behavior.
+            angle_trace = np.full(n_frames, np.nan, dtype=float)
+            for f in range(n_frames):
+                angle_trace[f] = self.calculate_angle(
                     x1=trial_info.trial_data[ag[0]].x_coord[f],
                     y1=trial_info.trial_data[ag[0]].y_coord[f],
                     z1=trial_info.trial_data[ag[0]].z_coord[f],
@@ -379,36 +369,16 @@ class SimpleCalculation:
                     y3=trial_info.trial_data[ag[2]].y_coord[f],
                     z3=trial_info.trial_data[ag[2]].z_coord[f]
                 )
-                collected_angle_data[joint_name].append(angle)
-
-            collected_angle_data[joint_name] = np.array(collected_angle_data[joint_name])
-            if apply_tracking_qc:
-                filtered_trace, qc_mask, qc_summary, _ = self.apply_angle_tracking_qc(
-                    trial_info=trial_info,
-                    angle_trace=collected_angle_data[joint_name],
-                    angle_points=ag,
-                    min_cameras=min_cameras,
-                    max_interp_gap_s=max_interp_gap_s,
-                    min_valid_fraction=min_valid_fraction,
-                    error_max=error_max,
-                    score_min=score_min,
-                    require_score=require_score,
-                    start_frame=qc_start,
-                    end_frame=qc_end,
-                    smooth=smooth_angle,
-                    smooth_method=smooth_method,
-                    smooth_window_frames=smooth_window_frames,
-                    smooth_polyorder=smooth_polyorder,
-                    smooth_alpha=smooth_alpha,
-                )
-                collected_angle_data[joint_name] = filtered_trace
-                qc_summary.update({
-                    "Joint": joint_name,
-                    "Angle_Definition": "|".join(ag),
-                })
-                qc_summaries.append(qc_summary)
+            collected_angle_data[joint_name] = angle_trace
 
         if return_qc:
+            if return_keypoint_qc:
+                # Optional third return exposes keypoint-level diagnostics without changing default callers.
+                return (
+                    collected_angle_data,
+                    pd.DataFrame(qc_summaries),
+                    pd.DataFrame(keypoint_qc_summaries),
+                )
             return collected_angle_data, pd.DataFrame(qc_summaries)
         return collected_angle_data
 
@@ -421,106 +391,6 @@ class SimpleCalculation:
         signal = f(x_new)
 
         return signal
-
-    def _permutation_test_unpaired(self, x, y, n_perm=10000, rng=None, return_distribution=False):
-        """
-        Primary p-value test for independent groups.
-        Uses fly-level RMST or LP values.
-        """
-        if rng is None:
-            rng = np.random.default_rng(0)
-
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-
-        # remove NaNs
-        x = x[~np.isnan(x)]
-        y = y[~np.isnan(y)]
-
-        if len(x) == 0 or len(y) == 0:
-            raise ValueError("One or both groups are empty after removing NaNs.")
-
-        observed = np.mean(y) - np.mean(x)
-
-        pooled = np.concatenate([x, y])
-        n_x = len(x)
-
-        perm_stats = np.empty(n_perm)
-
-        for i in range(n_perm):
-            perm = rng.permutation(pooled)
-            x_perm = perm[:n_x]
-            y_perm = perm[n_x:]
-            perm_stats[i] = np.mean(y_perm) - np.mean(x_perm)
-
-        # corrected p-value (IMPORTANT)
-        p_value = (np.sum(np.abs(perm_stats) >= np.abs(observed)) + 1) / (n_perm + 1)
-
-        if return_distribution:
-            return observed, p_value, perm_stats
-        return observed, p_value
-
-    def paired_signflip_permutation_test(
-            self,
-            values_a,
-            values_b,
-            n_perm=10000,
-            rng=None,
-            return_distribution=False
-    ):
-        """
-        Paired two-sided permutation test using random sign flips.
-
-        Returns the observed mean difference, mean(values_b - values_a), and
-        the permutation p-value. NaN pairs are removed before testing.
-        """
-        if rng is None:
-            rng = np.random.default_rng(0)
-
-        values_a = np.asarray(values_a, dtype=float)
-        values_b = np.asarray(values_b, dtype=float)
-        valid = np.isfinite(values_a) & np.isfinite(values_b)
-        diff = values_b[valid] - values_a[valid]
-        if len(diff) == 0:
-            if return_distribution:
-                return np.nan, np.nan, np.asarray([])
-            return np.nan, np.nan
-
-        observed = float(np.mean(diff))
-        perm_stats = np.empty(n_perm, dtype=float)
-        for i in range(n_perm):
-            signs = rng.choice([-1, 1], size=len(diff), replace=True)
-            perm_stats[i] = np.mean(diff * signs)
-
-        p_value = (np.sum(np.abs(perm_stats) >= np.abs(observed)) + 1) / (n_perm + 1)
-        if return_distribution:
-            return observed, float(p_value), perm_stats
-        return observed, float(p_value)
-
-    def paired_signflip_diff_test(self, diff, n_perm=10000, rng=None, return_distribution=False):
-        """
-        Paired sign-flip permutation test when paired differences are already computed.
-        """
-        if rng is None:
-            rng = np.random.default_rng(0)
-
-        diff = np.asarray(diff, dtype=float)
-        diff = diff[np.isfinite(diff)]
-        if len(diff) == 0:
-            if return_distribution:
-                return np.nan, np.nan, np.asarray([])
-            return np.nan, np.nan
-
-        observed = float(np.mean(diff))
-        perm_stats = np.empty(n_perm, dtype=float)
-        for i in range(n_perm):
-            signs = rng.choice([-1, 1], size=len(diff), replace=True)
-            perm_stats[i] = np.mean(diff * signs)
-
-        p_value = (np.sum(np.abs(perm_stats) >= np.abs(observed)) + 1) / (n_perm + 1)
-        if return_distribution:
-            return observed, float(p_value), perm_stats
-        return observed, float(p_value)
 
     def parse_index_cell(self, value):
         """

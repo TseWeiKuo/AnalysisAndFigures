@@ -9,10 +9,10 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import colors as mcolors
 from lifelines import KaplanMeierFitter
-from lifelines.statistics import logrank_test
 
 import tracking_qc as tqc
 import trial_helpers as th
+from survival_stats_runner import SurvivalStatsRunner
 
 
 def _get_style(style_input, index, label, default):
@@ -29,6 +29,12 @@ def _soften_color(color, softness):
     rgb = np.asarray(mcolors.to_rgb(color), dtype=float)
     softness = float(np.clip(softness, 0, 1))
     return tuple(rgb + (1.0 - rgb) * softness)
+
+
+def _get_stats_runner(self):
+    # PlotCreator owns the shared stats runner; standalone module calls create
+    # a local runner so the plotting function remains usable for direct tests.
+    return getattr(self, "stats_runner", SurvivalStatsRunner())
 
 
 def plot_LP_summary(
@@ -483,7 +489,6 @@ def plot_it_ot_landing_probability_and_latency(
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
-        require_score=False,
         smooth_angle=False,
         smooth_method="savgol",
         smooth_window_frames=5,
@@ -683,7 +688,6 @@ def plot_it_ot_landing_probability_and_latency(
             min_valid_fraction=min_valid_fraction,
             error_max=error_max,
             score_min=score_min,
-            require_score=require_score,
             smooth_angle=smooth_angle,
             smooth_method=smooth_method,
             smooth_window_frames=smooth_window_frames,
@@ -846,39 +850,22 @@ def plot_it_ot_landing_probability_and_latency(
         values = trial_df.loc[trial_df["Behavior_Label"] == label, "Success"].astype(float)
         return np.nan if values.empty else float(values.mean())
 
-    # Trial-level permutation test: keep the observed IT/OT sample sizes, shuffle
-    # success outcomes, and compare shuffled mean differences to the observed
-    # OT-minus-IT difference.
-    observed_diff = trial_mean(behavior_labels[1]) - trial_mean(behavior_labels[0])
-    label_counts = [int((trial_df["Behavior_Label"] == label).sum()) for label in behavior_labels]
-    outcomes = trial_df["Success"].astype(float).to_numpy()
-
-    perm_diffs = []
-    for _ in range(n_perm):
-        shuffled = rng.permutation(outcomes)
-        split_means = []
-        start = 0
-        for count in label_counts:
-            stop = start + count
-            split_means.append(np.mean(shuffled[start:stop]) if count > 0 else np.nan)
-            start = stop
-        perm_diffs.append(split_means[1] - split_means[0])
-
-    perm_diffs = np.asarray(perm_diffs, dtype=float)
-    p_value = (np.sum(np.abs(perm_diffs) >= abs(observed_diff)) + 1) / (np.sum(np.isfinite(perm_diffs)) + 1)
-
-    stat_df = pd.DataFrame([{
-        "Group_Name": group_info.group_name,
-        "Group_A": behavior_labels[0],
-        "Group_B": behavior_labels[1],
-        "n_A": label_counts[0],
-        "n_B": label_counts[1],
-        "mean_success_A": trial_mean(behavior_labels[0]),
-        "mean_success_B": trial_mean(behavior_labels[1]),
-        "mean_diff_B_minus_A": observed_diff,
-        "permutation_p": p_value,
-        "n_perm": n_perm,
-    }])
+    # Delegate the trial-level landing-probability label shuffle to the shared
+    # stats runner so p-value logic and reporting columns are centralized.
+    stats_runner = _get_stats_runner(self)
+    stat_df = stats_runner.trial_label_shuffle_binary_rate_test(
+        trial_df,
+        group_col="Behavior_Label",
+        outcome_col="Success",
+        group_a=behavior_labels[0],
+        group_b=behavior_labels[1],
+        metric="landing_probability",
+        n_perm=n_perm
+    )
+    # Add only the plot source label; statistical fields already use the shared
+    # compact schema from the stats runner.
+    stat_df.insert(0, "figure_group", group_info.group_name)
+    p_value = float(stat_df.iloc[0]["p_value"]) if not stat_df.empty else np.nan
 
     # Export all intermediate tables so the plotted values, statistics, angle
     # traces, and QC decisions can be inspected outside matplotlib.
@@ -1004,32 +991,25 @@ def plot_it_ot_landing_probability_and_latency(
             "median_survival_time": kmf.median_survival_time_,
         })
 
-    # Run a log-rank test between the first two behavior labels when both have
-    # data, then export the test result for reporting.
+    # Run a log-rank test between the first two behavior labels through the
+    # shared stats runner; censored rows remain contributing trials.
     km_stat_df = pd.DataFrame(km_rows)
     logrank_df = pd.DataFrame()
     logrank_p = np.nan
     if len(behavior_labels) >= 2:
-        km_a = trial_df[trial_df["Behavior_Label"] == behavior_labels[0]]
-        km_b = trial_df[trial_df["Behavior_Label"] == behavior_labels[1]]
-        if not km_a.empty and not km_b.empty:
-            logrank_result = logrank_test(
-                km_a["Duration"],
-                km_b["Duration"],
-                event_observed_A=km_a["Event"],
-                event_observed_B=km_b["Event"]
-            )
-            logrank_p = float(logrank_result.p_value)
-            logrank_df = pd.DataFrame([{
-                "Group_A": behavior_labels[0],
-                "Group_B": behavior_labels[1],
-                "n_A": len(km_a),
-                "n_B": len(km_b),
-                "events_A": int(km_a["Event"].sum()),
-                "events_B": int(km_b["Event"].sum()),
-                "test_statistic": float(logrank_result.test_statistic),
-                "p_value": logrank_p,
-            }])
+        logrank_df = stats_runner.logrank_latency_test(
+            trial_df,
+            group_col="Behavior_Label",
+            duration_col="Duration",
+            event_col="Event",
+            group_a=behavior_labels[0],
+            group_b=behavior_labels[1],
+            metric="landing_latency",
+            tau=tau
+        )
+        # The log-rank runner already records N, n, event counts, means, stds,
+        # tau placeholder, and p value in the shared compact schema.
+        logrank_p = float(logrank_df.iloc[0]["p_value"])
 
     if save_csv and file_name is not None:
         km_stat_df.to_csv(f"{file_name}_km_stats.csv", index=False)

@@ -29,10 +29,7 @@ def plot_selected_chrimson_angle_traces(
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
-        require_score=False,
         smooth_angle=True,
-        smooth_window_frames=5,
-        smooth_polyorder=2,
         qc_start=0,
         qc_end=2.0
 ):
@@ -162,10 +159,7 @@ def plot_selected_chrimson_angle_traces(
                 min_valid_fraction=min_valid_fraction,
                 error_max=error_max,
                 score_min=score_min,
-                require_score=require_score,
                 smooth_angle=smooth_angle,
-                smooth_window_frames=smooth_window_frames,
-                smooth_polyorder=smooth_polyorder,
                 qc_start=qc_start_frame,
                 qc_end=qc_end_frame,
                 return_qc=apply_tracking_qc
@@ -187,35 +181,10 @@ def plot_selected_chrimson_angle_traces(
                 joint_signal = np.asarray(angle_data[joint_name][trace_start:trace_end], dtype=float)
 
                 if apply_tracking_qc:
-                    # Re-check the exact plotted window after interpolation so
-                    # traces with excessive invalid burden are excluded.
-                    max_interp_gap_frames = tqc.interp_gap_frames_from_fps(
-                        max_interp_gap_s,
-                        trial_info.fps
-                    )
-                    qc_trace_start = max(qc_start_frame, trace_start)
-                    qc_trace_end = min(qc_end_frame + 1, trace_end)
-                    qc_start_offset = max(qc_trace_start - trace_start, 0)
-                    qc_end_offset = max(qc_trace_end - trace_start, qc_start_offset)
-                    qc_signal = joint_signal[qc_start_offset:qc_end_offset]
-                    window_valid = np.isfinite(qc_signal)
-                    window_valid_fraction = float(np.mean(window_valid)) if len(window_valid) else np.nan
-                    window_gaps = self.calculator.invalid_gap_lengths(window_valid) if len(window_valid) else []
-                    max_window_gap = int(max(window_gaps)) if window_gaps else 0
-                    finite_count = int(np.sum(window_valid))
-
-                    # Convert each failed plotted-window rule into an explicit
-                    # skipped-row reason for downstream inspection.
-                    skip_reason = ""
-                    if pd.isna(window_valid_fraction):
-                        skip_reason = "empty plotted window"
-                    elif window_valid_fraction < min_valid_fraction:
-                        skip_reason = "valid_fraction_below_threshold"
-                    elif max_window_gap > max_interp_gap_frames:
-                        skip_reason = "long_invalid_gap"
-                    elif finite_count < 2:
-                        skip_reason = "fewer_than_two_finite_frames"
-                    if skip_reason:
+                    # Calculate_joint_angle is now the sole tracking-QC gate;
+                    # plotting only checks whether the returned slice can be drawn.
+                    finite_count = int(np.sum(np.isfinite(joint_signal)))
+                    if finite_count < 2:
                         group_skipped_rows.append({
                             "Group_Name": group_info.group_name,
                             "Index": str(index),
@@ -223,24 +192,13 @@ def plot_selected_chrimson_angle_traces(
                             "Trial#": index[1],
                             "Joint": joint_name,
                             "Angle_Definition": "|".join(angle_def),
-                            "Reason": skip_reason,
+                            "Reason": "fewer_than_two_finite_frames",
                             "Alignment_Frame": alignment_frame,
                             "Trace_Start_Frame": trace_start,
                             "Trace_End_Frame": trace_end - 1,
-                            "QC_Start_Frame": qc_trace_start,
-                            "QC_End_Frame": qc_trace_end - 1,
                             "Requested_Start_s": start,
                             "Requested_End_s": end,
-                            "QC_Start_s": qc_window_start_s,
-                            "QC_End_s": qc_window_end_s,
-                            "Window_Frame_Count": int(len(qc_signal)),
                             "Finite_Frame_Count": finite_count,
-                            "Window_Valid_Frame_Fraction": window_valid_fraction,
-                            "Window_Max_Invalid_Gap_Frames": max_window_gap,
-                            "Min_Valid_Fraction": min_valid_fraction,
-                            "Max_Interp_Gap_s": max_interp_gap_s,
-                            "Max_Interp_Gap_Frames": max_interp_gap_frames,
-                            "Min_Cameras": min_cameras,
                         })
                         continue
 
@@ -400,11 +358,7 @@ def plot_wt_contact_group_angle_traces(
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
-        require_score=False,
         smooth_angle=False,
-        smooth_method="savgol",
-        smooth_window_frames=5,
-        smooth_polyorder=2,
         smooth_alpha=0.4,
         save_csv=True
 ):
@@ -529,11 +483,7 @@ def plot_wt_contact_group_angle_traces(
                 min_valid_fraction=min_valid_fraction,
                 error_max=error_max,
                 score_min=score_min,
-                require_score=require_score,
                 smooth_angle=smooth_angle,
-                smooth_method=smooth_method,
-                smooth_window_frames=smooth_window_frames,
-                smooth_polyorder=smooth_polyorder,
                 smooth_alpha=smooth_alpha,
                 qc_start=start_frame,
                 qc_end=end_frame,
@@ -573,32 +523,9 @@ def plot_wt_contact_group_angle_traces(
             source_time = (source_frames - moc) / fps
             source_trace = np.asarray(angle_trace[start_frame:end_frame + 1], dtype=float)
 
+            # After Calculate_joint_angle handles tracking QC, this is only a
+            # plotting/interpolation sanity check for the selected trace slice.
             valid = np.isfinite(source_time) & np.isfinite(source_trace)
-            window_valid_fraction = float(np.mean(valid)) if len(valid) else np.nan
-            max_invalid_gap = max(self.calculator.invalid_gap_lengths(valid), default=0)
-            # Resolve the time-based interpolation threshold in this trial's FPS
-            # before applying the final plotted-window QC check.
-            max_interp_gap_frames = tqc.interp_gap_frames_from_fps(max_interp_gap_s, fps)
-            if apply_tracking_qc and (
-                    window_valid_fraction < min_valid_fraction
-                    or max_invalid_gap > max_interp_gap_frames
-            ):
-                skipped_rows.append({
-                    "Column": column_label,
-                    "Contact_Group": contact_group,
-                    "Group_Name": group_info.group_name,
-                    "Index": str(index),
-                    "Fly#": index[0],
-                    "Trial#": index[1],
-                    "Joint_Type": joint_type,
-                    "Reason": "failed angle tracking QC",
-                    "Valid_Frame_Fraction": window_valid_fraction,
-                    "Max_Invalid_Gap_Frames": max_invalid_gap,
-                    "Min_Valid_Fraction": min_valid_fraction,
-                    "Max_Interp_Gap_s": max_interp_gap_s,
-                    "Max_Interp_Gap_Frames": max_interp_gap_frames,
-                })
-                continue
             if np.sum(valid) < 2:
                 skipped_rows.append({
                     "Column": column_label,
@@ -681,8 +608,6 @@ def plot_wt_contact_group_angle_traces(
                     "max_interp_gap_s": max_interp_gap_s if apply_tracking_qc else np.nan,
                     "min_valid_fraction": min_valid_fraction if apply_tracking_qc else np.nan,
                     "smooth_angle": smooth_angle,
-                    "smooth_method": smooth_method if smooth_angle else "",
-                    "smooth_window_frames": smooth_window_frames if smooth_angle else np.nan,
                     "smooth_alpha": smooth_alpha if smooth_angle else np.nan,
                 })
 
@@ -799,11 +724,7 @@ def flight_postural_change(
         min_valid_fraction=0.7,
         error_max=50,
         score_min=0.8,
-        require_score=False,
         smooth_angle=False,
-        smooth_method="savgol",
-        smooth_window_frames=5,
-        smooth_polyorder=2,
         smooth_alpha=0.4,
         save_csv=True
 ):
@@ -922,11 +843,7 @@ def flight_postural_change(
                     min_valid_fraction=min_valid_fraction,
                     error_max=error_max,
                     score_min=score_min,
-                    require_score=require_score,
                     smooth_angle=smooth_angle,
-                    smooth_method=smooth_method,
-                    smooth_window_frames=smooth_window_frames,
-                    smooth_polyorder=smooth_polyorder,
                     smooth_alpha=smooth_alpha,
                     qc_start=start_frame,
                     qc_end=end_frame,
