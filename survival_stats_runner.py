@@ -204,6 +204,13 @@ class SurvivalStatsRunner:
             "Std": np.nan if len(values) < 2 else float(np.std(values, ddof=1)),
         }
 
+    def _optional_int(self, value):
+        # Optional count fields can arrive as None or NaN from callers that do
+        # not have trial counts; keep those missing instead of casting to int.
+        if value is None or pd.isna(value):
+            return np.nan
+        return int(value)
+
     def p_to_significance(self, p_value, missing_label="n.s."):
         # Centralize figure p-value labels so plots use one threshold convention.
         if pd.isna(p_value):
@@ -257,14 +264,14 @@ class SurvivalStatsRunner:
             "metric": metric,
             "group_a": group_a,
             "group_b": group_b,
-            "N_a": int(len(values_a)) if n_fly_a is None else int(n_fly_a),
+            "N_a": int(len(values_a)) if n_fly_a is None else self._optional_int(n_fly_a),
             "mean_a": stats_a["Mean"],
             "std_a": stats_a["Std"],
-            "N_b": int(len(values_b)) if n_fly_b is None else int(n_fly_b),
+            "N_b": int(len(values_b)) if n_fly_b is None else self._optional_int(n_fly_b),
             "mean_b": stats_b["Mean"],
             "std_b": stats_b["Std"],
-            "n_a": np.nan if n_trials_a is None else int(n_trials_a),
-            "n_b": np.nan if n_trials_b is None else int(n_trials_b),
+            "n_a": self._optional_int(n_trials_a),
+            "n_b": self._optional_int(n_trials_b),
             "mean_diff_b_minus_a": np.nan,
             "p_value": np.nan,
             "n_perm": int(n_perm),
@@ -315,8 +322,8 @@ class SurvivalStatsRunner:
             "std_a": stats_a["Std"],
             "mean_b": stats_b["Mean"],
             "std_b": stats_b["Std"],
-            "n_a": np.nan if n_trials_a is None else int(n_trials_a),
-            "n_b": np.nan if n_trials_b is None else int(n_trials_b),
+            "n_a": self._optional_int(n_trials_a),
+            "n_b": self._optional_int(n_trials_b),
             "mean_diff_b_minus_a": np.nan,
             "p_value": np.nan,
             "n_perm": int(n_perm),
@@ -529,8 +536,8 @@ class SurvivalStatsRunner:
             "mean_y_b": np.nan,
             "std_x_b": np.nan,
             "std_y_b": np.nan,
-            "n_a": np.nan if n_trials_a is None else int(n_trials_a),
-            "n_b": np.nan if n_trials_b is None else int(n_trials_b),
+            "n_a": self._optional_int(n_trials_a),
+            "n_b": self._optional_int(n_trials_b),
             "vector_distance": np.nan,
             "delta_x_b_minus_a": np.nan,
             "delta_y_b_minus_a": np.nan,
@@ -640,8 +647,8 @@ class SurvivalStatsRunner:
             "N_b": int(len(vectors_b)),
             "circular_mean_b_deg": np.nan,
             "circular_std_b_deg": np.nan,
-            "n_a": np.nan if n_trials_a is None else int(n_trials_a),
-            "n_b": np.nan if n_trials_b is None else int(n_trials_b),
+            "n_a": self._optional_int(n_trials_a),
+            "n_b": self._optional_int(n_trials_b),
             "angular_distance_deg": np.nan,
             "p_value": np.nan,
             "n_perm": int(n_perm),
@@ -820,7 +827,7 @@ class SurvivalStatsRunner:
             "p_value": perm_p,
             "n_perm": n_perm,
             "tau": self.tau,
-            "n_pairwise_comparison": np.nan if pairwise_comparison_count is None else int(pairwise_comparison_count),
+            "n_pairwise_comparison": self._optional_int(pairwise_comparison_count),
         }])
 
         # Save both the fly-level input table and the one-row summary table.
@@ -995,7 +1002,7 @@ class SurvivalStatsRunner:
             "mean_diff_b_minus_a": observed_diff,
             "p_value": p_value,
             "n_perm": n_perm,
-            "n_pairwise_comparison": np.nan if pairwise_comparison_count is None else int(pairwise_comparison_count),
+            "n_pairwise_comparison": self._optional_int(pairwise_comparison_count),
         }])
 
         fly_table.to_csv(f"{out_prefix}-lp_fly_values.csv", index=False)
