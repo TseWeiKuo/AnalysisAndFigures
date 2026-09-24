@@ -6,29 +6,12 @@ Public callers should continue using KinematicPlot.PlotCreator.
 import itertools
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import seaborn as sns
 from lifelines import KaplanMeierFitter
 from lifelines.utils import restricted_mean_survival_time
-from openpyxl import load_workbook
 
-import tracking_qc as tqc
 from survival_stats_runner import SurvivalStatsRunner
-
-
-def _significance_label(p_value, missing_label=""):
-    if pd.isna(p_value):
-        return missing_label
-    if p_value < 1e-4:
-        return "****"
-    if p_value < 1e-3:
-        return "***"
-    if p_value < 1e-2:
-        return "**"
-    if p_value < 0.05:
-        return "*"
-    return "n.s."
 
 
 def _get_stats_runner(self):
@@ -36,252 +19,28 @@ def _get_stats_runner(self):
     # local runner so this module remains independently testable.
     return getattr(self, "stats_runner", SurvivalStatsRunner())
 
-def _initialize_chrimson_absolute_mol_metadata(
-        group_info,
-        light_on_frame=750,
-        tau=0.71,
-        require_kinematics=False
-):
-    """
-    Initialize CsChrimson metadata from LL sheets that store absolute MOL frames.
-
-    Numeric nonnegative values are treated as absolute MOL frames and converted
-    to latency frames relative to light_on_frame. -1 remains Flying, "NF"
-    remains NF, and blank cells remain NA.
-    """
-    if group_info.ll_data is None:
-        raise ValueError(f"LL/MOL metadata is required for {group_info.group_name}.")
-    if group_info.fps is None or len(group_info.fps) < group_info.total_fly_number:
-        raise ValueError(
-            f"FPS list for {group_info.group_name} must contain at least "
-            f"{group_info.total_fly_number} values."
-        )
-
-    group_info.latency_threshold = tau
-    group_info.landing_trial_index = []
-    group_info.flying_trial_index = []
-    group_info.not_flying_trial_index = []
-    group_info.NA_trial_index = []
-    group_info.trial_metadata = dict()
-    missing_trials = []
-
-    for i in range(group_info.total_fly_number):
-        for t in range(group_info.trial_num):
-            fly = i + 1
-            trial = t + 1
-            key = group_info._trial_key(fly, trial)
-
-            path = None
-            light = None
-            if key in group_info.fly_kinematic_data_path:
-                path = group_info.fly_kinematic_data_path[key]
-                light = group_info._get_opto_label_from_path(path)
-            else:
-                missing_trials.append(key)
-
-            mol_abs = group_info.ll_data.iloc[i, t]
-            if isinstance(mol_abs, str) and mol_abs == "NF":
-                trial_type = "NF"
-                ll_val = mol_abs
-            elif pd.isna(mol_abs):
-                trial_type = "NA"
-                ll_val = np.nan
-            elif mol_abs == -1:
-                trial_type = "Flying"
-                ll_val = -1
-            elif mol_abs >= 0:
-                trial_type = "Landing"
-                ll_val = int(round(mol_abs - light_on_frame))
-            else:
-                trial_type = "Unknown"
-                ll_val = np.nan
-
-            if trial_type == "Unknown":
-                raise ValueError(
-                    f"Cannot classify CsChrimson metadata value for "
-                    f"{group_info.group_name} {key}: {mol_abs}"
-                )
-
-            group_info.trial_metadata[key] = {
-                "Fly#": fly,
-                "Trial#": trial,
-                "LL": ll_val,
-                "MOC": np.nan,
-                "MOL": mol_abs,
-                "fps": group_info.fps[i],
-                "TrialType": trial_type,
-                "Path": path,
-                "Light": light,
-            }
-
-            idx = (fly, trial)
-            if trial_type == "Landing":
-                group_info.landing_trial_index.append(idx)
-            elif trial_type == "Flying":
-                group_info.flying_trial_index.append(idx)
-            elif trial_type == "NF":
-                group_info.not_flying_trial_index.append(idx)
-            elif trial_type == "NA":
-                group_info.NA_trial_index.append(idx)
-
-    if require_kinematics and missing_trials:
-        preview = ", ".join(missing_trials[:10])
-        more = "" if len(missing_trials) <= 10 else f" ... and {len(missing_trials) - 10} more"
-        raise FileNotFoundError(
-            f"Missing kinematic CSVs for Chr group {group_info.group_name}: {preview}{more}"
-        )
-
-
-def get_chrimson_metadata_on_ll_data(
+def get_opto_on_ll_data(
         group_info,
         tau=0.71,
-        light_on_frame=750,
         min_trial_num=8
 ):
-    _initialize_chrimson_absolute_mol_metadata(
-        group_info,
-        light_on_frame=light_on_frame,
-        tau=tau
-    )
+    # Initialize normal LL/MOC/MOL metadata when the caller has not already
+    # prepared the group in a notebook setup cell.
+    if len(group_info.trial_metadata) == 0:
+        group_info.initialize_manual_data()
+
+    # Apply the same ON/OFF fly filter used by the generic optogenetic plots.
     group_info.filter_opto_data(min_trial_num=min_trial_num)
     ll_df = group_info.get_LL(return_df=True)
     if ll_df.empty:
-        return pd.DataFrame(columns=["Group", "Latency", "Event", "Fly#", "Apply_Tracking_QC"])
+        # Landing latency is metadata-only, so this table intentionally carries
+        # no tracking-QC fields.
+        return pd.DataFrame(columns=["Group", "Latency", "Event", "Fly#"])
 
+    # Keep only light-on trials for selected-group CsChrimson KM summaries.
     on_df = ll_df[ll_df["Light"] == "ON"].copy()
     on_df = on_df.rename(columns={"Group_Name": "Group"})
-    on_df["Apply_Tracking_QC"] = False
-    return on_df[["Group", "Latency", "Event", "Fly#", "Apply_Tracking_QC"]]
-
-def plot_chrimson_LP_metadata(
-        self,
-        group_info,
-        color="red",
-        tau=0.71,
-        light_on_frame=750,
-        min_trial_num=8
-):
-    """
-    Plot paired ON/OFF CsChrimson LP using metadata only.
-
-    The LL metadata sheet is interpreted as absolute MOL frame numbers for
-    landing trials. Latency is computed as (MOL - light_on_frame) / fps, and
-    tau is used as the censoring/landing threshold.
-    """
-    _initialize_chrimson_absolute_mol_metadata(
-        group_info,
-        light_on_frame=light_on_frame,
-        tau=tau
-    )
-    group_info.filter_opto_data(min_trial_num=min_trial_num)
-
-    combined_df = group_info.get_paired_LP_df().copy()
-    if combined_df.empty:
-        raise ValueError(f"No paired ON/OFF metadata LP data found for {group_info.group_name}.")
-
-    combined_df["Group_Name"] = pd.Categorical(
-        combined_df["Group_Name"],
-        categories=["OFF", "ON"],
-        ordered=True
-    )
-    combined_df = combined_df.sort_values(by=["Fly#", "Group_Name"])
-
-    paired_df = combined_df.pivot(index="Fly#", columns="Group_Name", values="LandingProb")
-    paired_df = paired_df.dropna(subset=["OFF", "ON"]).copy()
-    if len(paired_df) >= 2:
-        paired_df["Diff_ON_minus_OFF"] = paired_df["ON"] - paired_df["OFF"]
-        # Delegate the paired OFF-vs-ON LP sign-flip test to the shared stats runner.
-        stat_df = _get_stats_runner(self).paired_signflip_test(
-            paired_df["OFF"].values,
-            paired_df["ON"].values,
-            group_a="OFF",
-            group_b="ON",
-            metric="metadata_landing_probability",
-            n_perm=20000,
-            n_trials_a=int(combined_df[combined_df["Group_Name"] == "OFF"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
-            n_trials_b=int(combined_df[combined_df["Group_Name"] == "ON"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
-            test_name="metadata_lp_paired_signflip"
-        )
-        # Add only metadata-specific context; the paired sign-flip result is
-        # already standardized by the stats runner.
-        stat_df.insert(0, "figure_group", group_info.group_name)
-        stat_df["tau"] = tau
-        stat_df["light_on_frame"] = light_on_frame
-        p_val = float(stat_df.iloc[0]["p_value"])
-    else:
-        paired_df["Diff_ON_minus_OFF"] = np.nan
-        p_val = np.nan
-        stat_df = pd.DataFrame()
-
-    mean_color = color
-    plt.figure(figsize=(6, 8))
-    ax = sns.pointplot(
-        data=combined_df,
-        x="Group_Name",
-        y="LandingProb",
-        errorbar=None,
-        color=color,
-        linestyles=" ",
-        markers="o"
-    )
-
-    for fly_id, group in combined_df.groupby("Fly#"):
-        plt.plot(
-            group["Group_Name"],
-            group["LandingProb"],
-            marker="o",
-            markersize=12,
-            color="lightgrey",
-            linewidth=3,
-            zorder=1
-        )
-
-    mean_df = combined_df.groupby("Group_Name", as_index=False)["LandingProb"].mean()
-    plt.plot(
-        mean_df["Group_Name"],
-        mean_df["LandingProb"],
-        color=mean_color,
-        marker="o",
-        markersize=12,
-        linewidth=3,
-        label="Mean",
-        zorder=9
-    )
-
-    y_max = combined_df["LandingProb"].max()
-    bracket_y = min(1.05, y_max + 0.10)
-    text_y = min(1.09, bracket_y + 0.03)
-    h = 0.02
-    ax.plot([0, 0, 1, 1], [bracket_y, bracket_y + h, bracket_y + h, bracket_y], lw=2.5, c="black")
-    ax.text(0.5, text_y, _significance_label(p_val, missing_label="n/a"), ha="center", va="bottom", fontsize=14)
-
-    plt.title("Metadata-Based Landing Probability Across Light Conditions")
-    plt.xlabel(group_info.group_name, fontsize=20)
-    plt.ylabel("Landing Probability", fontsize=20)
-    ax.spines["left"].set_linewidth(3)
-    ax.spines["bottom"].set_linewidth(3)
-    plt.tick_params(axis="y", labelsize=18)
-    plt.tick_params(axis="x", labelsize=18)
-    plt.tick_params(width=3, length=8)
-    plt.yticks([0, 0.5, 1])
-    plt.ylim(-0.1, 1.1)
-    plt.xlim(-0.5, 1.5)
-    sns.despine(trim=True)
-    plt.tight_layout()
-    plt.savefig(f"{group_info.group_name}-chr-LP-metadata.pdf")
-    plt.close()
-
-    paired_df.to_csv(f"{group_info.group_name}-metadata-paired_values.csv")
-    if not stat_df.empty:
-        stat_df.to_csv(f"{group_info.group_name}-chr-LP-metadata-signflip-stat.csv", index=False)
-
-    on_ll_data = get_chrimson_metadata_on_ll_data(
-        group_info,
-        tau=tau,
-        light_on_frame=light_on_frame,
-        min_trial_num=min_trial_num
-    )
-    return on_ll_data
+    return on_df[["Group", "Latency", "Event", "Fly#"]]
 
 def plot_kmc_and_unpaired_rmst_perm(self,
         data_list,

@@ -38,16 +38,14 @@ class SurvivalStatsRunner:
         self.rng = np.random.default_rng(random_state)
 
     # ------------------------------------------------------------
-    # Preparation helpers
+    # Preparation helpers: Proofread
     # ------------------------------------------------------------
-    def prepare_group(self, group_info, chr_data=False, use_opto_filter=False):
+    def prepare_group(self, group_info, use_opto_filter=False):
         # Initialize the group's manual metadata only when it has not already
-        # been loaded by an upstream notebook/script.
+        # been loaded by an upstream notebook/script; CsChrimson now uses the
+        # same LL/MOC/MOL metadata convention as the other groups.
         if len(group_info.trial_metadata) == 0:
-            if chr_data:
-                group_info.initialize_Chr_manual_data()
-            else:
-                group_info.initialize_manual_data()
+            group_info.initialize_manual_data()
 
         # Choose the filter that matches the planned comparison: optogenetic
         # paired analyses keep ON/OFF structure; regular analyses remove NaN fly
@@ -58,9 +56,9 @@ class SurvivalStatsRunner:
             group_info.filter_nan_fly()
 
     # ------------------------------------------------------------
-    # Trial-level dataframe builders
+    # Trial-level dataframe builders: Proofread
     # ------------------------------------------------------------
-    def get_landing_trial_df(self, group_info, chr_data=False, use_opto_filter=False):
+    def get_landing_trial_df(self, group_info, use_opto_filter=False):
         """
         Reuse your existing Group.get_LL(return_df=True).
         Returns one row per trial with columns like:
@@ -68,7 +66,7 @@ class SurvivalStatsRunner:
         """
         # Prepare metadata/filtering first, then ask the Group object for the
         # existing landing-latency KM table.
-        self.prepare_group(group_info, chr_data=chr_data, use_opto_filter=use_opto_filter)
+        self.prepare_group(group_info, use_opto_filter=use_opto_filter)
         df = group_info.get_LL(return_df=True).copy()
         # Return a schema-stable empty DataFrame if no rows are available.
         if df is None or len(df) == 0:
@@ -76,7 +74,7 @@ class SurvivalStatsRunner:
         return df
 
     # ------------------------------------------------------------
-    # RMST helpers
+    # RMST helpers: Proofread
     # ------------------------------------------------------------
     def compute_fly_rmst(self, trial_df, fly_col="Fly#", time_col="Latency", event_col="Event"):
         # Compute one restricted mean survival time value per fly. The fly is
@@ -100,7 +98,8 @@ class SurvivalStatsRunner:
             })
 
         return pd.DataFrame(rows).sort_values("Fly#").reset_index(drop=True)
-
+    
+    # Proofread
     def flywise_rmst(
             self,
             trial_df,
@@ -136,7 +135,8 @@ class SurvivalStatsRunner:
             })
             rows.append(row)
         return pd.DataFrame(rows).sort_values(groupby_cols).reset_index(drop=True)
-
+    
+    # Proofread
     def _permutation_test_unpaired(self, x, y, n_perm=10000):
         """
         Primary p-value test for independent groups.
@@ -163,7 +163,7 @@ class SurvivalStatsRunner:
         # Use the +1 correction so exact zero p-values are not reported.
         p_value = float((np.sum(np.abs(perm_stats) >= abs(observed)) + 1) / (n_perm + 1))
         return observed, p_value, perm_stats
-
+    # Proofread
     def _signflip_test_paired(self, diff, n_perm=10000):
         """
         Primary p-value test for paired ON/OFF data.
@@ -189,7 +189,7 @@ class SurvivalStatsRunner:
         return observed, p_value, perm_stats
 
     # ------------------------------------------------------------
-    # Shared inferential-test APIs
+    # Shared inferential-test APIs # Proofread
     # ------------------------------------------------------------
     def _clean_values(self, values):
         # Convert arbitrary numeric-like input into finite float values only.
@@ -236,7 +236,7 @@ class SurvivalStatsRunner:
         if pd.isna(rho):
             return "rho=NA"
         return f"rho={rho:.2f}"
-
+    # Proofread
     def unpaired_permutation_test(
             self,
             values_a,
@@ -288,7 +288,8 @@ class SurvivalStatsRunner:
             row["mean_diff_b_minus_a"] = float(observed)
             row["p_value"] = float(p_value)
         return pd.DataFrame([row])
-
+    
+    # Proofread
     def paired_signflip_test(
             self,
             values_a,
@@ -338,6 +339,7 @@ class SurvivalStatsRunner:
             row["p_value"] = float(p_value)
         return pd.DataFrame([row])
 
+    # Proofread
     def trial_label_shuffle_binary_rate_test(
             self,
             trial_df,
@@ -388,7 +390,8 @@ class SurvivalStatsRunner:
             "n_perm": int(n_perm),
             "n_pairwise_comparison": 1,
         }])
-
+    
+    # Proofread
     def spearman_correlation_test(self, x, y, group_name, metric_x, metric_y):
         # Run a trial-level Spearman correlation after dropping non-finite pairs.
         x = np.asarray(x, dtype=float)
@@ -414,6 +417,7 @@ class SurvivalStatsRunner:
             "p_value": p_value,
         }])
 
+    # Proofread
     def logrank_latency_test(
             self,
             trial_df,
@@ -462,7 +466,8 @@ class SurvivalStatsRunner:
             row["mean_diff_b_minus_a"] = row["mean_b"] - row["mean_a"]
             row["p_value"] = float(result.p_value)
         return pd.DataFrame([row])
-
+    
+    # Proofread
     def pairwise_flywise_rmst_permutation(
             self,
             fly_df,
@@ -608,7 +613,7 @@ class SurvivalStatsRunner:
         if resultant_length <= 0:
             return np.nan
         return float(np.degrees(np.sqrt(-2 * np.log(resultant_length))))
-
+    # Proofread
     def circular_angle_permutation_test(
             self,
             vectors_a,
@@ -692,7 +697,7 @@ class SurvivalStatsRunner:
         row["angular_distance_deg"] = observed_distance
         row["p_value"] = p_value
         return pd.DataFrame([row])
-
+    # Proofread
     def radial_direction_pairwise_tests(
             self,
             fly_vector_df,
@@ -910,22 +915,19 @@ class SurvivalStatsRunner:
 
         return summary, paired
 
-    # ------------------------------------------------------------
-    # Convenience wrappers: landing
-    # ------------------------------------------------------------
+    # Proofread
     def analyze_landing_unpaired(
             self,
             group_a,
             group_b,
             out_prefix,
-            chr_data=False,
             n_perm=10000,
             pairwise_comparison_count=None
     ):
         # Build landing-latency trial tables for two independent groups, then
         # run the shared unpaired fly-level RMST comparison.
-        df_a = self.get_landing_trial_df(group_a, chr_data=chr_data, use_opto_filter=False)
-        df_b = self.get_landing_trial_df(group_b, chr_data=chr_data, use_opto_filter=False)
+        df_a = self.get_landing_trial_df(group_a, use_opto_filter=False)
+        df_b = self.get_landing_trial_df(group_b, use_opto_filter=False)
         return self.compare_unpaired_groups(
             df_a=df_a,
             df_b=df_b,
@@ -935,13 +937,13 @@ class SurvivalStatsRunner:
             n_perm=n_perm,
             pairwise_comparison_count=pairwise_comparison_count,
         )
-
-    def analyze_landing_opto(self, group_info, out_prefix, chr_data=False, n_perm=10000):
+    # Proofread
+    def analyze_landing_opto(self, group_info, out_prefix, n_perm=10000):
         # Build one ON/OFF landing-latency trial table and run the paired RMST
         # comparison within flies.
-        df = self.get_landing_trial_df(group_info, chr_data=chr_data, use_opto_filter=True)
+        df = self.get_landing_trial_df(group_info, use_opto_filter=True)
         return self.compare_paired_opto(df, out_prefix=out_prefix, n_perm=n_perm)
-
+    # Proofread
     def compare_lp_unpaired(
             self,
             group_a,
@@ -1009,7 +1011,7 @@ class SurvivalStatsRunner:
         summary.to_csv(f"{out_prefix}-lp_summary.csv", index=False)
 
         return summary, fly_table
-
+    # Proofread
     def compare_lp_paired(self, group_info, out_prefix, on_label="ON", off_label="OFF", n_perm=10000):
         """
         Primary p-value test for paired ON/OFF landing probability.

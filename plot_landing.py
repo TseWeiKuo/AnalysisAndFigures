@@ -37,6 +37,21 @@ def _get_stats_runner(self):
     return getattr(self, "stats_runner", SurvivalStatsRunner())
 
 
+def _significance_label(p_value, missing_label="n/a"):
+    # Convert an exact p-value into the compact bracket label used across plots.
+    if pd.isna(p_value):
+        return missing_label
+    if p_value < 1e-4:
+        return "****"
+    if p_value < 1e-3:
+        return "***"
+    if p_value < 1e-2:
+        return "**"
+    if p_value < 0.05:
+        return "*"
+    return "n.s."
+
+
 def plot_LP_summary(
         self,
         data_to_plot,
@@ -210,10 +225,21 @@ def plot_LP_summary_from_groups(
         box_softness=box_softness
     )
 
-def plot_LP_summary_light(self, combined_df, file_name, color):
+def plot_LP_summary_light(self, combined_df, file_name, color, n_perm=20000):
     # Work on a copy so sorting and categorical conversion do not mutate the
     # caller's DataFrame.
     combined_df = combined_df.copy()
+    # Validate the metadata-derived LP table before trying to draw a paired
+    # OFF/ON plot; missing labels usually mean Light parsing failed upstream.
+    if combined_df.empty:
+        raise ValueError(f"No OFF/ON landing-probability rows are available for {file_name}.")
+    observed_conditions = set(combined_df["Group_Name"].dropna().astype(str))
+    missing_conditions = {"OFF", "ON"} - observed_conditions
+    if missing_conditions:
+        raise ValueError(
+            f"Paired OFF/ON LP plot for {file_name} is missing condition(s): "
+            f"{sorted(missing_conditions)}. Observed conditions: {sorted(observed_conditions)}."
+        )
     combined_df = combined_df.sort_values(by=["Fly#", "Group_Name"])
 
     # Keep only flies that have both OFF and ON rows. The paired plot assumes
@@ -229,8 +255,31 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
     # The pivot table is a paired-data check: rows with missing OFF or ON are
     # removed. The CSV export is left disabled but can be useful for inspection.
     paired_df = combined_df.pivot(index="Fly#", columns="Group_Name", values="LandingProb")
+    # Reindex prevents a pandas KeyError and makes the following dropna a clear
+    # paired-fly filter even if one condition is absent after categorical setup.
+    paired_df = paired_df.reindex(columns=["OFF", "ON"])
     paired_df = paired_df.dropna(subset=["OFF", "ON"])
     # paired_df.to_csv(f"{file_name}-paired_values.csv")
+
+    # Run the paired OFF-vs-ON LP sign-flip test once here so every optogenetic
+    # LP plot, including CsChrimson and GTACR, uses the same bracket statistic.
+    if len(paired_df) >= 2:
+        stat_df = _get_stats_runner(self).paired_signflip_test(
+            paired_df["OFF"].values,
+            paired_df["ON"].values,
+            group_a="OFF",
+            group_b="ON",
+            metric="landing_probability",
+            n_perm=n_perm,
+            n_trials_a=int(combined_df[combined_df["Group_Name"] == "OFF"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
+            n_trials_b=int(combined_df[combined_df["Group_Name"] == "ON"]["Trial_Count"].sum()) if "Trial_Count" in combined_df else np.nan,
+            test_name="paired_landing_probability_signflip"
+        )
+        stat_df.insert(0, "figure_group", str(file_name))
+        p_val = float(stat_df.iloc[0]["p_value"])
+    else:
+        stat_df = pd.DataFrame()
+        p_val = np.nan
 
     fig, ax = plt.subplots(figsize=(4, 7))
 
@@ -283,6 +332,12 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
         zorder=11
     )
 
+    # Draw a fixed OFF-vs-ON significance bracket above the paired LP traces.
+    bracket_y = 1.02
+    bracket_h = 0.03
+    ax.plot([0, 0, 1, 1], [bracket_y, bracket_y + bracket_h, bracket_y + bracket_h, bracket_y], lw=2.5, c="black")
+    ax.text(0.5, bracket_y + bracket_h + 0.015, _significance_label(p_val), ha="center", va="bottom", fontsize=14)
+
     ax.set_xticks([0, 1])
     ax.set_xticklabels(["OFF", "ON"])
 
@@ -298,15 +353,24 @@ def plot_LP_summary_light(self, combined_df, file_name, color):
     # plt.show()
     plt.close()
 
-def plot_LP_summary_light_from_group(self, group_info, file_name, color):
+    # Save compact plot-level statistics next to the figure for supplement-table
+    # collection without changing the plotting workflow.
+    if not stat_df.empty:
+        stat_df.to_csv(f"{file_name}-LP-signflip-stat.csv", index=False)
+    return combined_df
+
+def plot_LP_summary_light_from_group(self, group_info, file_name, color, min_trial_num=8, n_perm=20000):
     # Prepare an optogenetic group and delegate the actual plotting to the
     # DataFrame-based paired-light function.
     if len(group_info.trial_metadata) == 0:
         group_info.initialize_manual_data()
-        group_info.filter_opto_data()
+
+    # Always apply the paired optogenetic fly filter before plotting, regardless
+    # of whether the group was initialized in the notebook or inside this helper.
+    group_info.filter_opto_data(min_trial_num=min_trial_num)
 
     combined_df = group_info.get_paired_LP_df()
-    plot_LP_summary_light(self, combined_df, file_name, color)
+    return plot_LP_summary_light(self, combined_df, file_name, color, n_perm=n_perm)
 
 def plot_KM_curve(
         self,

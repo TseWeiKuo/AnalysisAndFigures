@@ -871,9 +871,33 @@ def plot_valid_sc_count_vs_landing_latency(
 
     # Save the trial-level count table and the single Success-vs-Failed count
     # comparison before plotting.
+    max_slc_count = 5
+    count_bins = np.arange(max_slc_count + 1)
+
+    distribution_rows = []
+    for outcome in ("Success", "Failed"):
+        # Calculate the discrete probability mass for SC counts within each
+        # outcome, so y is an actual probability bounded between 0 and 1.
+        values = count_df.loc[count_df["Outcome"] == outcome, "Valid_SC_Count"].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+        values = values[(values >= 0) & (values <= max_slc_count)]
+        total_trials = int(len(values))
+        for count_value in count_bins:
+            trial_count = int(np.sum(values == count_value))
+            probability = np.nan if total_trials == 0 else trial_count / total_trials
+            distribution_rows.append({
+                "Outcome": outcome,
+                "Valid_SC_Count": int(count_value),
+                "Probability": probability,
+                "Trial_Count": trial_count,
+                "Outcome_Total_Trials": total_trials,
+            })
+    distribution_df = pd.DataFrame(distribution_rows)
+
     if save_csv and file_name is not None:
         count_df.to_csv(f"{file_name}_data.csv", index=False)
         stat_df.to_csv(f"{file_name}_success_failed_count_stats.csv", index=False)
+        distribution_df.to_csv(f"{file_name}_sc_count_distribution.csv", index=False)
 
     fig, ax = plt.subplots(figsize=(6.4, 4.4))
 
@@ -920,7 +944,6 @@ def plot_valid_sc_count_vs_landing_latency(
 
     ax.set_xlabel("# valid leg contact events per trial")
     ax.set_ylabel("Landing latency (s)")
-    max_slc_count = 5
     ax.set_xticks(range(max_slc_count + 1))
     ax.set_xlim(-0.5, max_slc_count + 0.5)
     ax.set_title("Valid leg contact count vs landing latency")
@@ -932,4 +955,41 @@ def plot_valid_sc_count_vs_landing_latency(
         plt.savefig(f"{file_name}.pdf", dpi=300, bbox_inches="tight")
     plt.close()
 
-    return fig, ax, count_df, stat_df
+    prob_fig, prob_ax = plt.subplots(figsize=(5.8, 4.0))
+
+    # Draw the probability histogram directly from trial-level SC counts, with
+    # KDE overlaid only as a smoothed visual guide for the discrete distribution.
+    sns.histplot(
+        data=count_df[count_df["Valid_SC_Count"].between(0, max_slc_count)],
+        x="Valid_SC_Count",
+        hue="Outcome",
+        hue_order=["Success", "Failed"],
+        palette=colors,
+        stat="probability",
+        common_norm=False,
+        discrete=True,
+        binrange=(-0.5, max_slc_count + 0.5),
+        element="bars",
+        fill=True,
+        alpha=0.6,
+        linewidth=0,
+        edgecolor=None,
+        kde=True,
+        kde_kws={"clip": (0, max_slc_count), "cut": 0},
+        ax=prob_ax,
+    )
+
+    prob_ax.set_xlabel("# valid leg contact events per trial")
+    prob_ax.set_ylabel("Probability")
+    prob_ax.set_xticks(np.arange(0, 7))
+    prob_ax.set_xlim(-0.5, 6)
+    prob_ax.set_ylim(0, 1.05)
+    prob_ax.set_title("Valid leg contact count distribution")
+    prob_ax.legend(frameon=False, title="Outcome", loc="best")
+    sns.despine()
+    plt.tight_layout()
+    if file_name is not None:
+        plt.savefig(f"{file_name}_sc_count_distribution.pdf", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    return fig, ax, prob_fig, prob_ax, count_df, distribution_df, stat_df

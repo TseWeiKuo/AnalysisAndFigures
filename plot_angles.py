@@ -30,6 +30,7 @@ def plot_selected_chrimson_angle_traces(
         error_max=50,
         score_min=0.8,
         smooth_angle=True,
+        smooth_alpha=0.4,
         qc_start=0,
         qc_end=2.0
 ):
@@ -160,6 +161,9 @@ def plot_selected_chrimson_angle_traces(
                 error_max=error_max,
                 score_min=score_min,
                 smooth_angle=smooth_angle,
+                # Use the caller-selected EMA alpha instead of relying on the
+                # calculator default, keeping optogenetic and WT settings aligned.
+                smooth_alpha=smooth_alpha,
                 qc_start=qc_start_frame,
                 qc_end=qc_end_frame,
                 return_qc=apply_tracking_qc
@@ -913,13 +917,21 @@ def flight_postural_change(
     if value_df.empty:
         raise ValueError("No valid pre-MOC posture values were available for plotting.")
 
+    # Use one fixed valid-fly N per group so the summary table does not imply a
+    # different headline sample size for each trial number.
+    valid_fly_counts = (
+        value_df.groupby(["Group_Label", "Group_Name"])["Fly#"]
+        .nunique()
+        .to_dict()
+    )
+
     # Collapse fly-trial values by trial number. The SEM is across flies within
-    # each trial number, not across pooled frames or pooled trials.
+    # each trial number, using the group's valid-fly count as the denominator.
     for (group_label, group_name, trial_num), sub in value_df.groupby(["Group_Label", "Group_Name", "Trial#"]):
         values = sub["Mean_Pre_MOC_Angle_deg"].astype(float).dropna().to_numpy()
-        n_flies = len(values)
+        n_flies = int(valid_fly_counts.get((group_label, group_name), len(values)))
         sem = np.nan
-        if n_flies > 1:
+        if len(values) > 1 and n_flies > 1:
             sem = float(np.nanstd(values, ddof=1) / np.sqrt(n_flies))
         summary_rows.append({
             "Group_Label": group_label,
@@ -956,7 +968,9 @@ def flight_postural_change(
         if show_sem:
             plotted_values.extend([y - sem, y + sem])
 
-        ax.plot(x, y, color=color, linewidth=2.4, marker="o", markersize=4, label=str(group_label))
+        # Draw only the group mean trajectory; individual trial markers are
+        # intentionally omitted to keep this figure as a clean line trace.
+        ax.plot(x, y, color=color, linewidth=2.4, label=str(group_label))
         if show_sem:
             ax.fill_between(x, y - sem, y + sem, color=color, alpha=0.18, linewidth=0)
 

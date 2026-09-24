@@ -107,7 +107,14 @@ class PlotCreator:
             box_softness=0.65
     ):
         return pl.plot_LP_summary_from_groups(**locals())
-    def plot_LP_summary_light_from_group(self, group_info, file_name, color):
+    def plot_LP_summary_light_from_group(
+            self,
+            group_info,
+            file_name,
+            color,
+            min_trial_num=8,
+            n_perm=20000
+    ):
         return pl.plot_LP_summary_light_from_group(**locals())
     def plot_KM_curve_from_groups(
             self,
@@ -137,9 +144,12 @@ class PlotCreator:
             error_max=50,
             score_min=0.8,
             smooth_angle=True,
+            smooth_alpha=0.4,
             qc_start=0,
             qc_end=2.0
     ):
+        # Pass the EMA alpha through to the plotting implementation so notebook-level
+        # QC/smoothing settings control the CsChrimson angle traces consistently.
         return pa.plot_selected_chrimson_angle_traces(**locals())
     def plot_wt_contact_group_angle_traces(
             self,
@@ -293,26 +303,17 @@ class PlotCreator:
             score_min=0.8
     ):
         return pg.plot_left_TT_path_efficiency_grouped_stripplots(**locals())
-    def plot_chrimson_LP_metadata(
-            self,
-            group_info,
-            color="red",
-            tau=0.71,
-            light_on_frame=750,
-            min_trial_num=8
-    ):
-        return po.plot_chrimson_LP_metadata(**locals())
-    def get_chrimson_metadata_on_ll_data(
+    def get_opto_on_ll_data(
             self,
             group_info,
             tau=0.71,
-            light_on_frame=750,
             min_trial_num=8
     ):
-        return po.get_chrimson_metadata_on_ll_data(
+        # Keep ON-only latency extraction available through PlotCreator while
+        # using the standard initialized metadata for all optogenetic groups.
+        return po.get_opto_on_ll_data(
             group_info=group_info,
             tau=tau,
-            light_on_frame=light_on_frame,
             min_trial_num=min_trial_num
         )
     def plot_gtacr_LP_change_summary(
